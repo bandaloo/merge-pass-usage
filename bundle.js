@@ -93,7 +93,1504 @@ window.onload = function () {
 // vertical blur are two separate shaders, because they need to be run in
 // multiple passes. the rest of the effects were combined into one shader
 
-},{"@bandaloo/merge-pass":83,"core-js/modules/es.array.concat":56,"core-js/modules/es.string.repeat":57,"dat.gui":58}],2:[function(require,module,exports){
+},{"@bandaloo/merge-pass":26,"core-js/modules/es.array.concat":83,"core-js/modules/es.string.repeat":84,"dat.gui":85}],2:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.CodeBuilder = void 0;
+const expr_1 = require("./expressions/expr");
+const webglprogramloop_1 = require("./webglprogramloop");
+const FRAG_SET = `  gl_FragColor = texture2D(uSampler, gl_FragCoord.xy / uResolution);\n`;
+const SCENE_SET = `uniform sampler2D uSceneSampler;\n`;
+const TIME_SET = `uniform mediump float uTime;\n`;
+const BOILERPLATE = `#ifdef GL_ES
+precision mediump float;
+#endif
+
+uniform sampler2D uSampler;
+uniform mediump vec2 uResolution;\n`;
+class CodeBuilder {
+    constructor(effectLoop) {
+        this.calls = [];
+        this.externalFuncs = new Set();
+        this.uniformDeclarations = new Set();
+        this.counter = 0;
+        this.baseLoop = effectLoop;
+        const buildInfo = {
+            uniformTypes: {},
+            externalFuncs: new Set(),
+            exprs: [],
+            needs: {
+                centerSample: false,
+                neighborSample: false,
+                depthBuffer: false,
+                sceneBuffer: false,
+                timeUniform: false,
+            },
+        };
+        this.addEffectLoop(effectLoop, 1, buildInfo);
+        // add all the types to uniform declarations from the `BuildInfo` instance
+        for (const name in buildInfo.uniformTypes) {
+            const typeName = buildInfo.uniformTypes[name];
+            this.uniformDeclarations.add(`uniform mediump ${typeName} ${name};`);
+        }
+        //this.uniformNames = Object.keys(buildInfo.uniformTypes);
+        // add all external functions from the `BuildInfo` instance
+        buildInfo.externalFuncs.forEach((func) => this.externalFuncs.add(func));
+        this.totalNeeds = buildInfo.needs;
+        this.exprs = buildInfo.exprs;
+    }
+    addEffectLoop(effectLoop, indentLevel, buildInfo, topLevel = true) {
+        const needsLoop = !topLevel && effectLoop.repeat.num > 1;
+        if (needsLoop) {
+            const iName = "i" + this.counter;
+            indentLevel++;
+            const forStart = "  ".repeat(indentLevel - 1) +
+                `for (int ${iName} = 0; ${iName} < ${effectLoop.repeat.num}; ${iName}++) {`;
+            this.calls.push(forStart);
+        }
+        for (const e of effectLoop.effects) {
+            if (e instanceof expr_1.Expr) {
+                e.parse(buildInfo);
+                this.calls.push("  ".repeat(indentLevel) + "gl_FragColor = " + e.sourceCode + ";");
+                this.counter++;
+            }
+            else {
+                this.addEffectLoop(e, indentLevel, buildInfo, false);
+            }
+        }
+        if (needsLoop) {
+            this.calls.push("  ".repeat(indentLevel - 1) + "}");
+        }
+    }
+    compileProgram(gl, vShader, uniformLocs) {
+        // set up the fragment shader
+        const fShader = gl.createShader(gl.FRAGMENT_SHADER);
+        if (fShader === null) {
+            throw new Error("problem creating fragment shader");
+        }
+        const fullCode = BOILERPLATE +
+            (this.totalNeeds.sceneBuffer ? SCENE_SET : "") +
+            (this.totalNeeds.timeUniform ? TIME_SET : "") +
+            [...this.uniformDeclarations].join("\n") +
+            [...this.externalFuncs].join("\n") +
+            "\n" +
+            //this.funcs.join("\n") +
+            "void main() {\n" +
+            (this.totalNeeds.centerSample ? FRAG_SET : "") +
+            this.calls.join("\n") +
+            "\n}";
+        gl.shaderSource(fShader, fullCode);
+        gl.compileShader(fShader);
+        // set up the program
+        const program = gl.createProgram();
+        if (program === null) {
+            throw new Error("problem creating program");
+        }
+        gl.attachShader(program, vShader);
+        gl.attachShader(program, fShader);
+        const shaderLog = (name, shader) => {
+            const output = gl.getShaderInfoLog(shader);
+            if (output)
+                console.log(`${name} shader info log\n${output}`);
+        };
+        shaderLog("vertex", vShader);
+        shaderLog("fragment", fShader);
+        gl.linkProgram(program);
+        // we need to use the program here so we can get uniform locations
+        gl.useProgram(program);
+        console.log(fullCode);
+        // find all uniform locations and add them to the dictionary
+        for (const expr of this.exprs) {
+            for (const name in expr.uniformValChangeMap) {
+                const location = gl.getUniformLocation(program, name);
+                if (location === null) {
+                    throw new Error("couldn't find uniform " + name);
+                }
+                // makes sure you don't declare uniform with same name
+                if (uniformLocs[name] !== undefined) {
+                    throw new Error("uniforms have to all have unique names");
+                }
+                // assign the name to the location
+                uniformLocs[name] = location;
+            }
+        }
+        // set the uniform resolution (every program has this uniform)
+        const uResolution = gl.getUniformLocation(program, "uResolution");
+        gl.uniform2f(uResolution, gl.drawingBufferWidth, gl.drawingBufferHeight);
+        /*
+        if (this.baseLoop.getNeeds("sceneBuffer")) {
+          // TODO allow for texture options for scene texture
+          const sceneSamplerLocation = gl.getUniformLocation(
+            program,
+            "uSceneSampler"
+          );
+          // put the scene buffer in texture 1 (0 is used for the backbuffer)
+          gl.uniform1i(sceneSamplerLocation, 1);
+        }
+        */
+        if (this.totalNeeds.sceneBuffer) {
+            // TODO allow for texture options for scene texture
+            const sceneSamplerLocation = gl.getUniformLocation(program, "uSceneSampler");
+            // put the scene buffer in texture 1 (0 is used for the backbuffer)
+            gl.uniform1i(sceneSamplerLocation, 1);
+        }
+        // get attribute
+        const position = gl.getAttribLocation(program, "aPosition");
+        // enable the attribute
+        gl.enableVertexAttribArray(position);
+        // this will point to the vertices in the last bound array buffer.
+        // In this example, we only use one array buffer, where we're storing
+        // our vertices
+        gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+        return new webglprogramloop_1.WebGLProgramLoop(program, this.baseLoop.repeat, gl, this.totalNeeds, this.exprs);
+    }
+}
+exports.CodeBuilder = CodeBuilder;
+
+},{"./expressions/expr":8,"./webglprogramloop":28}],3:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.blur2d = exports.Blur2dLoop = void 0;
+const mergepass_1 = require("../mergepass");
+const blurexpr_1 = require("./blurexpr");
+const expr_1 = require("./expr");
+const vecexprs_1 = require("./vecexprs");
+class Blur2dLoop extends mergepass_1.EffectLoop {
+    constructor(horizontalExpr, verticalExpr, reps = 2) {
+        const side = blurexpr_1.gauss5(vecexprs_1.vec2(horizontalExpr, 0));
+        const up = blurexpr_1.gauss5(vecexprs_1.vec2(0, verticalExpr));
+        super([side, up], { num: reps });
+    }
+}
+exports.Blur2dLoop = Blur2dLoop;
+function blur2d(horizontalExpr, verticalExpr, reps) {
+    return new Blur2dLoop(expr_1.n2e(horizontalExpr), expr_1.n2e(verticalExpr), reps);
+}
+exports.blur2d = blur2d;
+
+},{"../mergepass":27,"./blurexpr":4,"./expr":8,"./vecexprs":23}],4:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.gauss5 = exports.BlurExpr = void 0;
+const glslfunctions_1 = require("../glslfunctions");
+const expr_1 = require("./expr");
+class BlurExpr extends expr_1.ExprVec4 {
+    constructor(direction) {
+        super(expr_1.tag `(gauss5(${direction}))`, ["uDirection"]);
+        this.externalFuncs = [glslfunctions_1.glslFuncs.gauss5];
+        this.needs.neighborSample = true;
+    }
+    setDirection(direction) {
+        this.setUniform("uDirection" + this.id, direction);
+    }
+}
+exports.BlurExpr = BlurExpr;
+function gauss5(direction) {
+    return new BlurExpr(direction);
+}
+exports.gauss5 = gauss5;
+
+},{"../glslfunctions":25,"./expr":8}],5:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.brightness = exports.Brightness = void 0;
+const expr_1 = require("./expr");
+const fragcolorexpr_1 = require("./fragcolorexpr");
+const glslfunctions_1 = require("../glslfunctions");
+class Brightness extends expr_1.ExprVec4 {
+    constructor(val, col = fragcolorexpr_1.fcolor()) {
+        super(expr_1.tag `(brightness(${val}, ${col}))`, ["uBrightness", "uColor"]);
+        this.externalFuncs = [glslfunctions_1.glslFuncs.brightness];
+    }
+    setBrightness(brightness) {
+        this.setUniform("uBrightness" + this.id, expr_1.n2e(brightness));
+    }
+}
+exports.Brightness = Brightness;
+function brightness(val, col) {
+    return new Brightness(expr_1.n2e(val), col);
+}
+exports.brightness = brightness;
+
+},{"../glslfunctions":25,"./expr":8,"./fragcolorexpr":9}],6:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.changecomp = exports.ChangeCompExpr = void 0;
+const expr_1 = require("./expr");
+const getcompexpr_1 = require("./getcompexpr");
+// test with just setting
+function getChangeFunc(typ, id, setter, comps, op = "") {
+    return `${typ} changecomp_${id}(${typ} col, ${setter.typeString()} setter) {
+  col.${comps} ${op}= setter;
+  return col;
+}`;
+}
+function checkGetComponents(comps, setter, vec) {
+    // setter has different length than components
+    if (comps.length !== getcompexpr_1.typeStringToLength(setter.typeString())) {
+        throw new Error("components length must be equal to the target float/vec");
+    }
+    // duplicate components
+    if (duplicateComponents(comps)) {
+        throw new Error("duplicate components not allowed on left side");
+    }
+    // legal components
+    getcompexpr_1.checkLegalComponents(comps, vec);
+}
+function duplicateComponents(comps) {
+    return new Set(comps.split("")).size !== comps.length;
+}
+class ChangeCompExpr extends expr_1.Operator {
+    constructor(vec, setter, comps, op) {
+        checkGetComponents(comps, setter, vec);
+        // TODO replace this random hash with string composed of operation properties
+        /** random hash to name a custom function */
+        const hash = Math.random().toString(36).substring(5);
+        console.log(hash);
+        super(vec, { sections: [`changecomp_${hash}(`, ", ", ")"], values: [vec, setter] }, ["uOriginal", "uNew"]);
+        this.externalFuncs = [
+            getChangeFunc(vec.typeString(), hash, setter, comps, op),
+        ];
+    }
+    setOriginal(vec) {
+        this.setUniform("uOriginal" + this.id, vec);
+    }
+    setNew(setter) {
+        this.setUniform("uNew" + this.id, expr_1.wrapInValue(setter));
+    }
+}
+exports.ChangeCompExpr = ChangeCompExpr;
+function changecomp(vec, setter, comps, op) {
+    return new ChangeCompExpr(vec, expr_1.wrapInValue(setter), comps, op);
+}
+exports.changecomp = changecomp;
+
+},{"./expr":8,"./getcompexpr":10}],7:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.contrast = exports.Contrast = void 0;
+const glslfunctions_1 = require("../glslfunctions");
+const expr_1 = require("./expr");
+const fragcolorexpr_1 = require("./fragcolorexpr");
+class Contrast extends expr_1.ExprVec4 {
+    constructor(val, col = fragcolorexpr_1.fcolor()) {
+        super(expr_1.tag `contrast(${val}, ${col})`, ["uVal", "uCol"]);
+        this.externalFuncs = [glslfunctions_1.glslFuncs.contrast];
+    }
+    setContrast(contrast) {
+        this.setUniform("uContrast" + this.id, expr_1.n2p(contrast));
+    }
+}
+exports.Contrast = Contrast;
+function contrast(val, col) {
+    return new Contrast(expr_1.n2e(val), col);
+}
+exports.contrast = contrast;
+
+},{"../glslfunctions":25,"./expr":8,"./fragcolorexpr":9}],8:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.tag = exports.wrapInValue = exports.pfloat = exports.n2p = exports.n2e = exports.Operator = exports.ExprVec4 = exports.ExprVec3 = exports.ExprVec2 = exports.float = exports.ExprFloat = exports.BasicFloat = exports.ExprVec = exports.BasicVec4 = exports.BasicVec3 = exports.BasicVec2 = exports.BasicVec = exports.PrimitiveVec4 = exports.PrimitiveVec3 = exports.PrimitiveVec2 = exports.PrimitiveVec = exports.PrimitiveFloat = exports.Primitive = exports.mut = exports.Mutable = exports.Expr = void 0;
+const mergepass_1 = require("../mergepass");
+function toGLSLFloatString(num) {
+    let str = "" + num;
+    if (!str.includes("."))
+        str += ".";
+    return str;
+}
+class Expr {
+    constructor(sourceLists, defaultNames) {
+        this.added = false;
+        this.needs = {
+            depthBuffer: false,
+            neighborSample: false,
+            centerSample: false,
+            sceneBuffer: false,
+            timeUniform: false,
+        };
+        this.uniformValChangeMap = {};
+        this.defaultNameMap = {};
+        this.externalFuncs = [];
+        this.sourceCode = "";
+        this.id = "_id_" + Expr.count;
+        Expr.count++;
+        if (sourceLists.sections.length - sourceLists.values.length !== 1) {
+            // this cannot happen if you use `tag` to destructure a template string
+            throw new Error("wrong lengths for source and values");
+        }
+        if (sourceLists.values.length !== defaultNames.length) {
+            throw new Error("default names list length doesn't match values list length");
+        }
+        this.sourceLists = sourceLists;
+        this.defaultNames = defaultNames;
+    }
+    applyUniforms(gl, uniformLocs) {
+        for (const name in this.uniformValChangeMap) {
+            const loc = uniformLocs[name];
+            if (this.uniformValChangeMap[name].changed) {
+                this.uniformValChangeMap[name].changed = false;
+                this.uniformValChangeMap[name].val.applyUniform(gl, loc);
+            }
+        }
+    }
+    getNeeds(name) {
+        return this.needs[name];
+    }
+    getSampleNum(mult = 1) {
+        return this.needs.neighborSample ? mult : 0;
+    }
+    setUniform(name, newVal) {
+        var _a, _b;
+        const originalName = name;
+        if (typeof newVal === "number") {
+            newVal = n2p(newVal);
+        }
+        if (!(newVal instanceof Primitive)) {
+            throw new Error("cannot set a non-primitive");
+        }
+        // if name does not exist, try mapping default name to new name
+        if (((_a = this.uniformValChangeMap[name]) === null || _a === void 0 ? void 0 : _a.val) === undefined) {
+            name = this.defaultNameMap[name];
+        }
+        const oldVal = (_b = this.uniformValChangeMap[name]) === null || _b === void 0 ? void 0 : _b.val;
+        if (oldVal === undefined) {
+            throw new Error("tried to set uniform " +
+                name +
+                " which doesn't exist." +
+                " original name: " +
+                originalName);
+        }
+        if (oldVal.typeString() !== newVal.typeString()) {
+            throw new Error("tried to set uniform " + name + " to a new type");
+        }
+        this.uniformValChangeMap[name].val = newVal;
+        this.uniformValChangeMap[name].changed = true;
+    }
+    /** parses this expression into a string, adding info as it recurses */
+    parse(buildInfo) {
+        if (this.added) {
+            throw new Error("expression already added to another part of tree");
+        }
+        this.sourceCode = "";
+        buildInfo.exprs.push(this);
+        const updateNeed = (name) => (buildInfo.needs[name] = buildInfo.needs[name] || this.needs[name]);
+        // update me on change to needs: no good way to iterate through an interface
+        updateNeed("centerSample");
+        updateNeed("neighborSample");
+        updateNeed("depthBuffer");
+        updateNeed("sceneBuffer");
+        updateNeed("timeUniform");
+        // add each of the external funcs to the builder
+        this.externalFuncs.forEach((func) => buildInfo.externalFuncs.add(func));
+        // put all of the values between all of the source sections
+        for (let i = 0; i < this.sourceLists.values.length; i++) {
+            this.sourceCode +=
+                this.sourceLists.sections[i] +
+                    this.sourceLists.values[i].parse(buildInfo, this.defaultNames[i], this);
+        }
+        // TODO does sourceCode have to be a member?
+        this.sourceCode += this.sourceLists.sections[this.sourceLists.sections.length - 1];
+        this.added = true;
+        return this.sourceCode;
+    }
+}
+exports.Expr = Expr;
+Expr.count = 0;
+class Mutable {
+    constructor(primitive, name) {
+        this.added = false;
+        this.primitive = primitive;
+        this.name = name;
+    }
+    parse(buildInfo, defaultName, enc) {
+        if (this.added) {
+            throw new Error("mutable expression already added to another part of tree");
+        }
+        if (enc === undefined) {
+            throw new Error("tried to put a mutable expression at the top level");
+        }
+        // accept the default name if given no name
+        if (this.name === undefined)
+            this.name = defaultName + enc.id;
+        // set to true so they are set to their default values on first draw
+        buildInfo.uniformTypes[this.name] = this.primitive.typeString();
+        // add the name mapping
+        enc.uniformValChangeMap[this.name] = {
+            val: this.primitive,
+            changed: true,
+        };
+        // add the new type to the map
+        enc.defaultNameMap[defaultName + enc.id] = this.name;
+        this.added = true;
+        return this.name;
+    }
+    applyUniform(gl, loc) {
+        this.primitive.applyUniform(gl, loc);
+    }
+    typeString() {
+        return this.primitive.typeString();
+    }
+}
+exports.Mutable = Mutable;
+function mut(val, name) {
+    const primitive = typeof val === "number" ? n2p(val) : val;
+    return new Mutable(primitive, name);
+}
+exports.mut = mut;
+class Primitive {
+    constructor() {
+        this.added = false;
+    }
+    parse(buildInfo, defaultName, enc) {
+        // TODO see if this is okay actually
+        if (this.added) {
+            throw new Error("primitive expression already added to another part of tree");
+        }
+        this.added = true;
+        return this.toString();
+    }
+}
+exports.Primitive = Primitive;
+class PrimitiveFloat extends Primitive {
+    constructor(num) {
+        // TODO throw error when NaN, Infinity or -Infinity
+        super();
+        this.value = num;
+    }
+    toString() {
+        let str = "" + this.value;
+        if (!str.includes("."))
+            str += ".";
+        return str;
+    }
+    typeString() {
+        return "float";
+    }
+    applyUniform(gl, loc) {
+        gl.uniform1f(loc, this.value);
+    }
+}
+exports.PrimitiveFloat = PrimitiveFloat;
+class PrimitiveVec extends Primitive {
+    constructor(comps) {
+        super();
+        this.values = comps;
+    }
+    typeString() {
+        return ("vec" + this.values.length);
+    }
+    toString() {
+        return `${this.typeString}(${this.values
+            .map((n) => toGLSLFloatString(n))
+            .join(", ")})`;
+    }
+}
+exports.PrimitiveVec = PrimitiveVec;
+class PrimitiveVec2 extends PrimitiveVec {
+    applyUniform(gl, loc) {
+        gl.uniform2f(loc, this.values[0], this.values[1]);
+    }
+}
+exports.PrimitiveVec2 = PrimitiveVec2;
+class PrimitiveVec3 extends PrimitiveVec {
+    applyUniform(gl, loc) {
+        gl.uniform3f(loc, this.values[0], this.values[1], this.values[2]);
+    }
+}
+exports.PrimitiveVec3 = PrimitiveVec3;
+class PrimitiveVec4 extends PrimitiveVec {
+    applyUniform(gl, loc) {
+        gl.uniform4f(loc, this.values[0], this.values[1], this.values[2], this.values[3]);
+    }
+}
+exports.PrimitiveVec4 = PrimitiveVec4;
+class BasicVec extends Expr {
+    constructor(sourceLists, defaultNames) {
+        super(sourceLists, defaultNames);
+        // this cast is fine as long as you only instantiate these with the
+        // shorthand version
+        const values = sourceLists.values;
+        this.values = values;
+        this.defaultNames = defaultNames;
+    }
+    typeString() {
+        return ("vec" + this.values.length);
+    }
+    setComp(index, primitive) {
+        if (index < 0 || index >= this.values.length) {
+            throw new Error("out of bounds of setting component");
+        }
+        this.setUniform(this.defaultNames[index] + this.id, n2p(primitive));
+    }
+}
+exports.BasicVec = BasicVec;
+class BasicVec2 extends BasicVec {
+    constructor() {
+        super(...arguments);
+        this.bvec2 = undefined; // brand for nominal typing
+    }
+}
+exports.BasicVec2 = BasicVec2;
+class BasicVec3 extends BasicVec {
+    constructor() {
+        super(...arguments);
+        this.bvec3 = undefined; // brand for nominal typing
+    }
+}
+exports.BasicVec3 = BasicVec3;
+class BasicVec4 extends BasicVec {
+    constructor() {
+        super(...arguments);
+        this.bvec4 = undefined; // brand for nominal typing
+    }
+}
+exports.BasicVec4 = BasicVec4;
+class ExprVec extends Expr {
+    constructor(sourceLists, defaultNames) {
+        super(sourceLists, defaultNames);
+        const values = sourceLists.values;
+        this.values = values;
+        this.defaultNames = defaultNames;
+    }
+}
+exports.ExprVec = ExprVec;
+class BasicFloat extends Expr {
+    constructor(sourceLists, defaultNames) {
+        super(sourceLists, defaultNames);
+        this.float = undefined; // brand for nominal typing
+    }
+    setVal(primitive) {
+        this.setUniform("uFloat" + this.id, n2p(primitive));
+    }
+    typeString() {
+        return "float";
+    }
+}
+exports.BasicFloat = BasicFloat;
+class ExprFloat extends Expr {
+    constructor(sourceLists, defaultNames) {
+        super(sourceLists, defaultNames);
+        this.float = undefined; // brand for nominal typing
+    }
+    setVal(primitive) {
+        this.setUniform("uFloat" + this.id, n2p(primitive));
+    }
+    typeString() {
+        return "float";
+    }
+}
+exports.ExprFloat = ExprFloat;
+function float(value) {
+    if (typeof value === "number")
+        value = n2p(value);
+    return new BasicFloat({ sections: ["", ""], values: [value] }, ["uFloat"]);
+}
+exports.float = float;
+class ExprVec2 extends ExprVec {
+    constructor() {
+        super(...arguments);
+        this.vec2 = undefined; // brand for nominal typing
+    }
+    typeString() {
+        return "vec2";
+    }
+}
+exports.ExprVec2 = ExprVec2;
+class ExprVec3 extends ExprVec {
+    constructor() {
+        super(...arguments);
+        this.vec3 = undefined; // brand for nominal typing
+    }
+    typeString() {
+        return "vec3";
+    }
+}
+exports.ExprVec3 = ExprVec3;
+class ExprVec4 extends ExprVec {
+    constructor() {
+        super(...arguments);
+        this.vec4 = undefined; // brand for nominal typing
+    }
+    repeat(num) {
+        return new mergepass_1.EffectLoop([this], { num: num });
+    }
+    genPrograms(gl, vShader, uniformLocs) {
+        return new mergepass_1.EffectLoop([this], { num: 1 }).genPrograms(gl, vShader, uniformLocs);
+    }
+    typeString() {
+        return "vec4";
+    }
+}
+exports.ExprVec4 = ExprVec4;
+class Operator extends Expr {
+    constructor(ret, sourceLists, defaultNames) {
+        super(sourceLists, defaultNames);
+        this.ret = ret;
+    }
+    typeString() {
+        return this.ret.typeString();
+    }
+}
+exports.Operator = Operator;
+// TODO is this necessary? can we just use wrapInValue?
+/** number to expression float */
+function n2e(num) {
+    if (num instanceof PrimitiveFloat ||
+        num instanceof ExprFloat ||
+        num instanceof Operator ||
+        num instanceof Mutable ||
+        num instanceof BasicFloat)
+        return num;
+    return new PrimitiveFloat(num);
+}
+exports.n2e = n2e;
+/** number to primitive float */
+function n2p(num) {
+    if (num instanceof PrimitiveFloat)
+        return num;
+    return new PrimitiveFloat(num);
+}
+exports.n2p = n2p;
+function pfloat(num) {
+    return new PrimitiveFloat(num);
+}
+exports.pfloat = pfloat;
+function wrapInValue(num) {
+    if (typeof num === "number")
+        return pfloat(num);
+    return num;
+}
+exports.wrapInValue = wrapInValue;
+function tag(strings, ...values) {
+    return { sections: strings.concat([]), values: values };
+}
+exports.tag = tag;
+
+},{"../mergepass":27}],9:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.fcolor = exports.FragColorExpr = void 0;
+const expr_1 = require("./expr");
+class FragColorExpr extends expr_1.ExprVec4 {
+    constructor() {
+        super(expr_1.tag `gl_FragColor`, []);
+        this.needs.centerSample = true;
+    }
+}
+exports.FragColorExpr = FragColorExpr;
+function fcolor() {
+    return new FragColorExpr();
+}
+exports.fcolor = fcolor;
+
+},{"./expr":8}],10:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.get4comp = exports.get3comp = exports.get2comp = exports.getcomp = exports.Get4CompExpr = exports.Get3CompExpr = exports.Get2CompExpr = exports.GetCompExpr = exports.checkLegalComponents = exports.typeStringToLength = void 0;
+const expr_1 = require("./expr");
+// TODO this should probably be somewhere else
+function typeStringToLength(str) {
+    switch (str) {
+        case "float":
+            return 1;
+        case "vec2":
+            return 2;
+        case "vec3":
+            return 3;
+        case "vec4":
+            return 4;
+    }
+}
+exports.typeStringToLength = typeStringToLength;
+function genCompSource(vec, components) {
+    return {
+        sections: ["", "." + components],
+        values: [vec],
+    };
+}
+function checkLegalComponents(comps, vec) {
+    const check = (range, domain) => {
+        let inside = 0;
+        let outside = 0;
+        for (const c of range) {
+            domain.includes(c) ? inside++ : outside++;
+        }
+        return inside === inside && !outside;
+    };
+    const inLen = typeStringToLength(vec.typeString());
+    const rgbaCheck = check(comps, "rgba".substr(0, inLen));
+    const xyzwCheck = check(comps, "xyzw".substr(0, inLen));
+    if (!(rgbaCheck || xyzwCheck)) {
+        throw new Error("component sets are mixed or incorrect entirely");
+    }
+}
+exports.checkLegalComponents = checkLegalComponents;
+function checkGetComponents(comps, outLen, vec) {
+    if (comps.length > outLen)
+        throw new Error("too many components");
+    checkLegalComponents(comps, vec);
+}
+class GetCompExpr extends expr_1.ExprFloat {
+    constructor(vec, comps) {
+        checkGetComponents(comps, 1, vec);
+        super(genCompSource(vec, comps), ["uVec"]);
+    }
+}
+exports.GetCompExpr = GetCompExpr;
+class Get2CompExpr extends expr_1.ExprVec2 {
+    constructor(vec, comps) {
+        checkGetComponents(comps, 2, vec);
+        super(genCompSource(vec, comps), ["uVec"]);
+    }
+}
+exports.Get2CompExpr = Get2CompExpr;
+class Get3CompExpr extends expr_1.ExprVec3 {
+    constructor(vec, comps) {
+        checkGetComponents(comps, 3, vec);
+        super(genCompSource(vec, comps), ["uVec"]);
+    }
+}
+exports.Get3CompExpr = Get3CompExpr;
+class Get4CompExpr extends expr_1.ExprVec4 {
+    constructor(vec, comps) {
+        checkGetComponents(comps, 4, vec);
+        super(genCompSource(vec, comps), ["uVec"]);
+    }
+}
+exports.Get4CompExpr = Get4CompExpr;
+function getcomp(vec, comps) {
+    return new GetCompExpr(vec, comps);
+}
+exports.getcomp = getcomp;
+function get2comp(vec, comps) {
+    return new Get2CompExpr(vec, comps);
+}
+exports.get2comp = get2comp;
+function get3comp(vec, comps) {
+    return new Get3CompExpr(vec, comps);
+}
+exports.get3comp = get3comp;
+function get4comp(vec, comps) {
+    return new Get4CompExpr(vec, comps);
+}
+exports.get4comp = get4comp;
+
+},{"./expr":8}],11:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.grain = exports.GrainExpr = void 0;
+const glslfunctions_1 = require("../glslfunctions");
+const expr_1 = require("./expr");
+class GrainExpr extends expr_1.ExprVec4 {
+    constructor(val) {
+        // TODO compose with other expressions rather than write full glsl?
+        super(expr_1.tag `vec4((1.0 - ${val} * random(gl_FragCoord.xy)) * gl_FragColor.rgb, gl_FragColor.a);`, ["uGrain"]);
+        this.externalFuncs = [glslfunctions_1.glslFuncs.random];
+        // TODO get rid of this if we choose to use fcolor instead later
+        this.needs.centerSample = true;
+    }
+    setGrain(grain) {
+        this.setUniform("uGrain" + this.id, expr_1.n2e(grain));
+    }
+}
+exports.GrainExpr = GrainExpr;
+function grain(val) {
+    return new GrainExpr(expr_1.n2e(val));
+}
+exports.grain = grain;
+
+},{"../glslfunctions":25,"./expr":8}],12:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.hsv2rgb = exports.HSVToRGBExpr = void 0;
+const expr_1 = require("./expr");
+const glslfunctions_1 = require("../glslfunctions");
+class HSVToRGBExpr extends expr_1.ExprVec4 {
+    constructor(col) {
+        super(expr_1.tag `hsv2rgb(${col})`, ["uHSVCol"]);
+        this.externalFuncs = [glslfunctions_1.glslFuncs.hsv2rgb];
+    }
+}
+exports.HSVToRGBExpr = HSVToRGBExpr;
+function hsv2rgb(col) {
+    return new HSVToRGBExpr(col);
+}
+exports.hsv2rgb = hsv2rgb;
+
+},{"../glslfunctions":25,"./expr":8}],13:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.len = exports.LenExpr = void 0;
+const expr_1 = require("./expr");
+class LenExpr extends expr_1.ExprFloat {
+    constructor(vec) {
+        super(expr_1.tag `(length(${vec}))`, ["uVec"]);
+        this.vec = vec;
+    }
+    setVec(vec) {
+        this.setUniform("uVec" + this.id, vec);
+    }
+}
+exports.LenExpr = LenExpr;
+function len(vec) {
+    return new LenExpr(vec);
+}
+exports.len = len;
+
+},{"./expr":8}],14:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ncfcoord = exports.NormCenterFragCoordExpr = void 0;
+const expr_1 = require("./expr");
+class NormCenterFragCoordExpr extends expr_1.ExprVec2 {
+    constructor() {
+        super(expr_1.tag `(gl_FragCoord.xy / uResolution - 0.5)`, []);
+    }
+}
+exports.NormCenterFragCoordExpr = NormCenterFragCoordExpr;
+function ncfcoord() {
+    return new NormCenterFragCoordExpr();
+}
+exports.ncfcoord = ncfcoord;
+
+},{"./expr":8}],15:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.nfcoord = exports.NormFragCoordExpr = void 0;
+const expr_1 = require("./expr");
+class NormFragCoordExpr extends expr_1.ExprVec2 {
+    constructor() {
+        super(expr_1.tag `(gl_FragCoord.xy / uResolution)`, []);
+    }
+}
+exports.NormFragCoordExpr = NormFragCoordExpr;
+function nfcoord() {
+    return new NormFragCoordExpr();
+}
+exports.nfcoord = nfcoord;
+
+},{"./expr":8}],16:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.op = exports.OpExpr = void 0;
+const expr_1 = require("./expr");
+function genOpSourceList(left, op, right) {
+    return {
+        sections: ["(", ` ${op} `, ")"],
+        values: [left, right],
+    };
+}
+class OpExpr extends expr_1.Operator {
+    constructor(left, op, right) {
+        super(left, genOpSourceList(left, op, right), ["uLeft", "uRight"]);
+        this.left = left;
+        this.right = right;
+    }
+    setLeft(left) {
+        this.setUniform("uLeft" + this.id, expr_1.wrapInValue(left));
+    }
+    setRight(right) {
+        this.setUniform("uRight" + this.id, expr_1.wrapInValue(right));
+    }
+}
+exports.OpExpr = OpExpr;
+// implementation
+function op(left, op, right) {
+    return new OpExpr(expr_1.wrapInValue(left), op, expr_1.wrapInValue(right));
+}
+exports.op = op;
+
+},{"./expr":8}],17:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.pblur = exports.PowerBlurLoop = void 0;
+const mergepass_1 = require("../mergepass");
+const blurexpr_1 = require("./blurexpr");
+const vecexprs_1 = require("./vecexprs");
+const expr_1 = require("./expr");
+const baseLog = (x, y) => Math.log(y) / Math.log(x);
+class PowerBlurLoop extends mergepass_1.EffectLoop {
+    constructor(size) {
+        const side = blurexpr_1.gauss5(expr_1.mut(vecexprs_1.pvec2(size, 0)));
+        const up = blurexpr_1.gauss5(expr_1.mut(vecexprs_1.pvec2(0, size)));
+        const reps = Math.ceil(baseLog(2, size));
+        super([side, up], {
+            num: reps + 1,
+        });
+        this.size = size;
+        this.repeat.func = (i) => {
+            const distance = this.size / Math.pow(2, i);
+            up.setDirection(vecexprs_1.pvec2(0, distance));
+            side.setDirection(vecexprs_1.pvec2(distance, 0));
+        };
+    }
+    setSize(size) {
+        this.size = size;
+        this.repeat.num = Math.ceil(baseLog(2, size));
+    }
+}
+exports.PowerBlurLoop = PowerBlurLoop;
+/**
+ * fast approximate blur for large blur radius that might look good in some cases
+ */
+function pblur(size) {
+    return new PowerBlurLoop(size);
+}
+exports.pblur = pblur;
+
+},{"../mergepass":27,"./blurexpr":4,"./expr":8,"./vecexprs":23}],18:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.RandomExpr = void 0;
+const glslfunctions_1 = require("../glslfunctions");
+const expr_1 = require("./expr");
+class RandomExpr extends expr_1.ExprVec4 {
+    constructor() {
+        super(expr_1.tag `(random(gl_FragCoord.xy))`, []);
+        this.externalFuncs = [glslfunctions_1.glslFuncs.random];
+    }
+}
+exports.RandomExpr = RandomExpr;
+
+},{"../glslfunctions":25,"./expr":8}],19:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.rgb2hsv = exports.RGBToHSVExpr = void 0;
+const expr_1 = require("./expr");
+const glslfunctions_1 = require("../glslfunctions");
+class RGBToHSVExpr extends expr_1.ExprVec4 {
+    constructor(col) {
+        super(expr_1.tag `rgb2hsv(${col})`, ["uRGBCol"]);
+        this.externalFuncs = [glslfunctions_1.glslFuncs.rgb2hsv];
+    }
+}
+exports.RGBToHSVExpr = RGBToHSVExpr;
+function rgb2hsv(col) {
+    return new RGBToHSVExpr(col);
+}
+exports.rgb2hsv = rgb2hsv;
+
+},{"../glslfunctions":25,"./expr":8}],20:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.input = exports.SceneSampleExpr = void 0;
+const expr_1 = require("./expr");
+const normfragcoordexpr_1 = require("./normfragcoordexpr");
+class SceneSampleExpr extends expr_1.ExprVec4 {
+    constructor(coord = normfragcoordexpr_1.nfcoord()) {
+        super(expr_1.tag `(texture2D(uSceneSampler, ${coord}))`, ["uVec"]);
+        this.needs.sceneBuffer = true;
+    }
+}
+exports.SceneSampleExpr = SceneSampleExpr;
+function input(vec) {
+    return new SceneSampleExpr(vec);
+}
+exports.input = input;
+
+},{"./expr":8,"./normfragcoordexpr":15}],21:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.setcolor = exports.SetColorExpr = void 0;
+const expr_1 = require("./expr");
+class SetColorExpr extends expr_1.ExprVec4 {
+    constructor(val) {
+        super(expr_1.tag `(${val})`, ["uVal"]);
+    }
+}
+exports.SetColorExpr = SetColorExpr;
+function setcolor(val) {
+    return new SetColorExpr(val);
+}
+exports.setcolor = setcolor;
+
+},{"./expr":8}],22:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.time = exports.TimeExpr = void 0;
+const expr_1 = require("./expr");
+class TimeExpr extends expr_1.ExprFloat {
+    constructor() {
+        super(expr_1.tag `uTime`, []);
+        this.needs.timeUniform = true;
+    }
+}
+exports.TimeExpr = TimeExpr;
+function time() {
+    return new TimeExpr();
+}
+exports.time = time;
+
+},{"./expr":8}],23:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.pvec4 = exports.pvec3 = exports.pvec2 = exports.vec4 = exports.vec3 = exports.vec2 = void 0;
+const expr_1 = require("./expr");
+function vecSourceList(...components) {
+    const sections = ["vec" + components.length + "("];
+    for (let i = 0; i < components.length - 1; i++) {
+        sections.push(", ");
+    }
+    const defaultNames = [];
+    for (let i = 0; i < components.length; i++) {
+        defaultNames.push("uComp" + i);
+    }
+    sections.push(")");
+    return [{ sections: sections, values: components }, defaultNames];
+}
+// expression vector shorthands
+function vec2(comp1, comp2) {
+    return new expr_1.BasicVec2(...vecSourceList(...[comp1, comp2].map((c) => expr_1.n2e(c))));
+}
+exports.vec2 = vec2;
+function vec3(comp1, comp2, comp3) {
+    return new expr_1.BasicVec3(...vecSourceList(...[comp1, comp2, comp3].map((c) => expr_1.n2e(c))));
+}
+exports.vec3 = vec3;
+function vec4(comp1, comp2, comp3, comp4) {
+    return new expr_1.BasicVec4(...vecSourceList(...[comp1, comp2, comp3, comp4].map((c) => expr_1.n2e(c))));
+}
+exports.vec4 = vec4;
+// primitive vector shorthands
+function pvec2(comp1, comp2) {
+    return new expr_1.PrimitiveVec2([comp1, comp2]);
+}
+exports.pvec2 = pvec2;
+function pvec3(comp1, comp2, comp3) {
+    return new expr_1.PrimitiveVec2([comp1, comp2, comp3]);
+}
+exports.pvec3 = pvec3;
+function pvec4(comp1, comp2, comp3, comp4) {
+    return new expr_1.PrimitiveVec2([comp1, comp2, comp3, comp4]);
+}
+exports.pvec4 = pvec4;
+
+},{"./expr":8}],24:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+
+},{}],25:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.glslFuncs = void 0;
+// adapted from The Book of Shaders
+exports.glslFuncs = {
+    // TODO replace with a better one
+    random: `float random(vec2 st) {
+  return fract(sin(dot(st.xy / 99., vec2(12.9898, 78.233))) * 43758.5453123);
+}`,
+    //  rotate2d: `mat2 rotate2d(float angle) {
+    //  return mat2(cos(angle), -sin(angle), sin(angle), cos(angle));
+    //}`,
+    //  scale: `mat2 scale(vec2 scale) {
+    //  return mat2(scale.x, 0.0, 0.0, scale.y);
+    //}`,
+    hsv2rgb: `vec4 hsv2rgb(vec4 co){
+  vec3 c = co.xyz;
+  vec3 rgb = clamp(abs(mod(
+    c.x * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+  rgb = rgb * rgb * (3.0 - 2.0 * rgb);
+  vec3 hsv = c.z * mix(vec3(1.0), rgb, c.y);
+  return vec4(hsv.x, hsv.y, hsv.z, co.a);
+}`,
+    rgb2hsv: `vec4 rgb2hsv(vec4 co){
+  vec3 c = co.rgb;
+  vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+  vec4 p = mix(vec4(c.bg, K.wz),
+               vec4(c.gb, K.xy),
+               step(c.b, c.g));
+  vec4 q = mix(vec4(p.xyw, c.r),
+               vec4(c.r, p.yzx),
+               step(p.x, c.r));
+  float d = q.x - min(q.w, q.y);
+  float e = 1.0e-10;
+  return vec4(abs(q.z + (q.w - q.y) / (6.0 * d + e)),
+              d / (q.x + e),
+              q.x, co.a);
+}`,
+    // adapted from https://github.com/Jam3/glsl-fast-gaussian-blur/blob/master/5.glsl
+    gauss5: `vec4 gauss5(vec2 dir) {
+  vec2 uv = gl_FragCoord.xy / uResolution;
+  vec2 direction = dir;
+  vec4 col = vec4(0.0);
+  vec2 off1 = vec2(1.3333333333333333) * direction;
+  col += texture2D(uSampler, uv) * 0.29411764705882354;
+  col += texture2D(uSampler, uv + (off1 / uResolution)) * 0.35294117647058826;
+  col += texture2D(uSampler, uv - (off1 / uResolution)) * 0.35294117647058826;
+  return col;
+}`,
+    contrast: `vec4 contrast(float val, vec4 col) {
+  col.rgb /= col.a;
+  col.rgb = ((col.rgb - 0.5) * val) + 0.5;
+  col.rgb *= col.a;
+  return col;
+}`,
+    brightness: `vec4 brightness(float val, vec4 col) {
+  col.rgb /= col.a;
+  col.rgb += val;
+  col.rgb *= col.a;
+  return col;
+}`,
+    hsvmask: `void main(vec4 mask, vec4 components, vec4 col) {
+  vec3 hsv = rgb2hsv(col.rgb);
+  vec3 m = mask;
+  hsv.xyz = (vec3(1., 1., 1.) - m) * components + m * hsv.xyz;
+  vec3 rgb = hsv2rgb(hsv);
+  col = vec4(rgb.r, rgb.g, rgb.b, gl_FragColor.a);
+  return col;
+}`,
+    setxyz: `vec4 setxyz (vec3 comp, vec3 mask, vec4 col) {
+  col.xyz = (vec3(1., 1., 1.) - mask) * comp + m * hsv.xyz;
+}`,
+};
+
+},{}],26:[function(require,module,exports){
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __exportStar = (this && this.__exportStar) || function(m, exports) {
+    for (var p in m) if (p !== "default" && !exports.hasOwnProperty(p)) __createBinding(exports, m, p);
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+// TODO export fewer things for the user
+__exportStar(require("./mergepass"), exports);
+__exportStar(require("./exprtypes"), exports);
+__exportStar(require("./glslfunctions"), exports);
+__exportStar(require("./expressions/blurexpr"), exports);
+__exportStar(require("./expressions/randomexpr"), exports);
+__exportStar(require("./expressions/fragcolorexpr"), exports);
+__exportStar(require("./expressions/vecexprs"), exports);
+__exportStar(require("./expressions/opexpr"), exports);
+__exportStar(require("./expressions/powerblur"), exports);
+__exportStar(require("./expressions/blur2dloop"), exports);
+__exportStar(require("./expressions/lenexpr"), exports);
+__exportStar(require("./expressions/normfragcoordexpr"), exports);
+__exportStar(require("./expressions/normcenterfragcoordexpr"), exports);
+__exportStar(require("./expressions/scenesampleexpr"), exports);
+__exportStar(require("./expressions/brightnessexpr"), exports);
+__exportStar(require("./expressions/setcolorexpr"), exports);
+__exportStar(require("./expressions/contrastexpr"), exports);
+__exportStar(require("./expressions/grainexpr"), exports);
+__exportStar(require("./expressions/getcompexpr"), exports);
+__exportStar(require("./expressions/changecompexpr"), exports);
+__exportStar(require("./expressions/rgbtohsvexpr"), exports);
+__exportStar(require("./expressions/hsvtorgbexpr"), exports);
+__exportStar(require("./expressions/timeexpr"), exports);
+__exportStar(require("./expressions/expr"), exports);
+
+},{"./expressions/blur2dloop":3,"./expressions/blurexpr":4,"./expressions/brightnessexpr":5,"./expressions/changecompexpr":6,"./expressions/contrastexpr":7,"./expressions/expr":8,"./expressions/fragcolorexpr":9,"./expressions/getcompexpr":10,"./expressions/grainexpr":11,"./expressions/hsvtorgbexpr":12,"./expressions/lenexpr":13,"./expressions/normcenterfragcoordexpr":14,"./expressions/normfragcoordexpr":15,"./expressions/opexpr":16,"./expressions/powerblur":17,"./expressions/randomexpr":18,"./expressions/rgbtohsvexpr":19,"./expressions/scenesampleexpr":20,"./expressions/setcolorexpr":21,"./expressions/timeexpr":22,"./expressions/vecexprs":23,"./exprtypes":24,"./glslfunctions":25,"./mergepass":27}],27:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.sendTexture = exports.makeTexture = exports.Merger = exports.loop = exports.EffectLoop = exports.getNeedsOfList = void 0;
+const codebuilder_1 = require("./codebuilder");
+const webglprogramloop_1 = require("./webglprogramloop");
+// TODO get rid of this
+function getNeedsOfList(name, list) {
+    if (list.length === 0) {
+        throw new Error("list was empty, so no needs could be found");
+    }
+    const bools = list.map((e) => e.getNeeds(name));
+    return bools.reduce((acc, curr) => acc || curr);
+}
+exports.getNeedsOfList = getNeedsOfList;
+class EffectLoop {
+    constructor(effects, repeat) {
+        this.effects = effects;
+        this.repeat = repeat;
+    }
+    getNeeds(name) {
+        return getNeedsOfList(name, this.effects);
+        //const bools: boolean[] = this.effects.map((e) => e.getNeeds(name));
+        //return bools.reduce((acc: boolean, curr: boolean) => acc || curr);
+    }
+    getSampleNum(mult = 1) {
+        mult *= this.repeat.num;
+        let acc = 0;
+        for (const e of this.effects) {
+            acc += e.getSampleNum(mult);
+        }
+        return acc;
+    }
+    /** places effects into loops broken up by sampling effects */
+    regroup() {
+        let sampleCount = 0;
+        /** number of samples in all previous */
+        let prevSampleCount = 0;
+        let prevEffects = [];
+        const regroupedEffects = [];
+        const breakOff = () => {
+            if (prevEffects.length > 0) {
+                // break off all previous effects into their own loop
+                if (prevEffects.length === 1) {
+                    // this is to prevent wrapping in another effect loop
+                    regroupedEffects.push(prevEffects[0]);
+                }
+                else {
+                    regroupedEffects.push(new EffectLoop(prevEffects, { num: 1 }));
+                }
+                sampleCount -= prevSampleCount;
+                prevEffects = [];
+            }
+        };
+        for (const e of this.effects) {
+            const sampleNum = e.getSampleNum();
+            prevSampleCount = sampleCount;
+            sampleCount += sampleNum;
+            if (sampleCount > 0)
+                breakOff();
+            prevEffects.push(e);
+        }
+        // push on all the straggling effects after the grouping is done
+        breakOff();
+        return regroupedEffects;
+    }
+    /** recursive descent parser for turning effects into programs */
+    genPrograms(gl, vShader, uniformLocs) {
+        // TODO we probably don't need scenesource anymore
+        if (this.getSampleNum() / this.repeat.num <= 1) {
+            // if this group only samples neighbors at most once, create program
+            const codeBuilder = new codebuilder_1.CodeBuilder(this);
+            const program = codeBuilder.compileProgram(gl, vShader, uniformLocs);
+            return program;
+        }
+        // otherwise, regroup and try again on regrouped loops
+        this.effects = this.regroup();
+        // okay to have undefined needs here
+        return new webglprogramloop_1.WebGLProgramLoop(this.effects.map((e) => e.genPrograms(gl, vShader, uniformLocs)), this.repeat, gl);
+    }
+}
+exports.EffectLoop = EffectLoop;
+function loop(effects, rep) {
+    return new EffectLoop(effects, { num: rep });
+}
+exports.loop = loop;
+const V_SOURCE = `attribute vec2 aPosition;
+void main() {
+  gl_Position = vec4(aPosition, 0.0, 1.0);
+}\n`;
+class Merger {
+    constructor(effects, source, gl, options) {
+        this.uniformLocs = {};
+        // wrap the given list of effects as a loop if need be
+        if (!(effects instanceof EffectLoop)) {
+            this.effectLoop = new EffectLoop(effects, { num: 1 });
+        }
+        else {
+            this.effectLoop = effects;
+        }
+        if (this.effectLoop.effects.length === 0) {
+            throw new Error("list of effects was empty");
+        }
+        this.source = source;
+        this.gl = gl;
+        this.options = options;
+        // set the viewport
+        this.gl.viewport(0, 0, this.gl.drawingBufferWidth, this.gl.drawingBufferHeight);
+        // set up the vertex buffer
+        const vertexBuffer = this.gl.createBuffer();
+        this.gl.bindBuffer(this.gl.ARRAY_BUFFER, vertexBuffer);
+        const vertexArray = [-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1];
+        const triangles = new Float32Array(vertexArray);
+        this.gl.bufferData(this.gl.ARRAY_BUFFER, triangles, this.gl.STATIC_DRAW);
+        // compile the simple vertex shader (2 big triangles)
+        const vShader = this.gl.createShader(this.gl.VERTEX_SHADER);
+        if (vShader === null) {
+            throw new Error("problem creating the vertex shader");
+        }
+        this.gl.shaderSource(vShader, V_SOURCE);
+        this.gl.compileShader(vShader);
+        // make textures
+        this.tex = {
+            front: makeTexture(this.gl, this.options),
+            back: makeTexture(this.gl, this.options),
+            scene: undefined,
+        };
+        // create the framebuffer
+        const framebuffer = gl.createFramebuffer();
+        if (framebuffer === null) {
+            throw new Error("problem creating the framebuffer");
+        }
+        this.framebuffer = framebuffer;
+        // generate the fragment shaders and programs
+        this.programLoop = this.effectLoop.genPrograms(this.gl, vShader, this.uniformLocs);
+        // find the final program
+        let atBottom = false;
+        let currProgramLoop = this.programLoop;
+        while (!atBottom) {
+            if (currProgramLoop.programElement instanceof WebGLProgram) {
+                // we traveled right and hit a program, so it must be the last
+                currProgramLoop.last = true;
+                atBottom = true;
+            }
+            else {
+                // set the current program loop to the last in the list
+                currProgramLoop =
+                    currProgramLoop.programElement[currProgramLoop.programElement.length - 1];
+            }
+        }
+        if (this.programLoop.getTotalNeeds().sceneBuffer) {
+            this.tex.scene = makeTexture(this.gl, this.options);
+        }
+        // TODO get rid of this (or make it only log when verbose)
+        console.log(this.programLoop);
+    }
+    draw(time = 0) {
+        //this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, this.framebuffer);
+        this.gl.activeTexture(this.gl.TEXTURE0);
+        this.gl.bindTexture(this.gl.TEXTURE_2D, this.tex.back);
+        sendTexture(this.gl, this.source);
+        if (this.programLoop.getTotalNeeds().sceneBuffer &&
+            this.tex.scene !== undefined) {
+            this.gl.activeTexture(this.gl.TEXTURE1);
+            this.gl.bindTexture(this.gl.TEXTURE_2D, this.tex.scene);
+            sendTexture(this.gl, this.source);
+        }
+        // swap textures before beginning draw
+        this.programLoop.draw(this.gl, this.tex, this.framebuffer, this.uniformLocs, this.programLoop.last, time);
+    }
+}
+exports.Merger = Merger;
+function makeTexture(gl, options) {
+    const texture = gl.createTexture();
+    if (texture === null) {
+        throw new Error("problem creating texture");
+    }
+    // flip the order of the pixels, or else it displays upside down
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    // bind the texture after creating it
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.drawingBufferWidth, gl.drawingBufferHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    const filterMode = (f) => f === undefined || f === "linear" ? gl.LINEAR : gl.NEAREST;
+    // how to map texture element
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filterMode(options === null || options === void 0 ? void 0 : options.minFilterMode));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filterMode(options === null || options === void 0 ? void 0 : options.maxFilterMode));
+    if ((options === null || options === void 0 ? void 0 : options.edgeMode) !== "wrap") {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    }
+    return texture;
+}
+exports.makeTexture = makeTexture;
+function sendTexture(gl, src) {
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+}
+exports.sendTexture = sendTexture;
+
+},{"./codebuilder":2,"./webglprogramloop":28}],28:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.WebGLProgramLoop = void 0;
+class WebGLProgramLoop {
+    constructor(programElement, repeat, gl, totalNeeds, // only defined when leaf
+    effects = [] // only populated when leaf
+    ) {
+        var _a;
+        this.last = false;
+        this.programElement = programElement;
+        this.repeat = repeat;
+        this.totalNeeds = totalNeeds;
+        this.effects = effects;
+        if (programElement instanceof WebGLProgram) {
+            if (gl === undefined) {
+                throw new Error("program element is a program but context is undefined");
+            }
+            if ((_a = this.totalNeeds) === null || _a === void 0 ? void 0 : _a.timeUniform) {
+                gl.useProgram(programElement);
+                const timeLoc = gl.getUniformLocation(programElement, "uTime");
+                if (timeLoc === null) {
+                    throw new Error("could not get the time uniform location");
+                }
+                this.timeLoc = timeLoc;
+            }
+        }
+    }
+    getTotalNeeds() {
+        // go through needs of program loop
+        if (!(this.programElement instanceof WebGLProgram)) {
+            const allNeeds = [];
+            for (const p of this.programElement) {
+                allNeeds.push(p.getTotalNeeds());
+            }
+            // update me on change to needs
+            return allNeeds.reduce((acc, curr) => {
+                return {
+                    neighborSample: acc.neighborSample || curr.neighborSample,
+                    centerSample: acc.centerSample || curr.centerSample,
+                    sceneBuffer: acc.sceneBuffer || curr.sceneBuffer,
+                    depthBuffer: acc.depthBuffer || curr.depthBuffer,
+                    timeUniform: acc.timeUniform || curr.timeUniform,
+                };
+            });
+        }
+        if (this.totalNeeds === undefined) {
+            throw new Error("total needs of webgl program was somehow undefined");
+        }
+        return this.totalNeeds;
+    }
+    draw(gl, tex, framebuffer, uniformLocs, last, time) {
+        var _a, _b;
+        for (let i = 0; i < this.repeat.num; i++) {
+            const newLast = i === this.repeat.num - 1;
+            if (this.programElement instanceof WebGLProgram) {
+                // effects list is populated
+                if (i === 0) {
+                    gl.useProgram(this.programElement);
+                    if ((_a = this.totalNeeds) === null || _a === void 0 ? void 0 : _a.sceneBuffer) {
+                        if (tex.scene === undefined) {
+                            throw new Error("needs scene buffer, but scene texture is somehow undefined");
+                        }
+                        gl.activeTexture(gl.TEXTURE1);
+                        gl.bindTexture(gl.TEXTURE_2D, tex.scene);
+                    }
+                    for (const effect of this.effects) {
+                        effect.applyUniforms(gl, uniformLocs);
+                    }
+                    if ((_b = this.totalNeeds) === null || _b === void 0 ? void 0 : _b.timeUniform) {
+                        if (this.timeLoc === undefined || time === undefined) {
+                            throw new Error("time or location is undefined");
+                        }
+                        gl.uniform1f(this.timeLoc, time);
+                    }
+                }
+                if (newLast && last && this.last) {
+                    // we are on the final pass of the final loop, so draw screen by
+                    // setting to the default framebuffer
+                    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                }
+                else {
+                    // we have to bounce between two textures
+                    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+                    // use the framebuffer to write to front texture
+                    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex.front, 0);
+                }
+                // allows us to read from `texBack`
+                // default sampler is 0, so `uSampler` uniform will always sample from texture 0
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, tex.back);
+                [tex.back, tex.front] = [tex.front, tex.back];
+                // go back to the default framebuffer object
+                // use our last program as the draw program
+                gl.drawArrays(gl.TRIANGLES, 0, 6);
+            }
+            else {
+                if (this.repeat.func !== undefined) {
+                    this.repeat.func(i);
+                }
+                for (const p of this.programElement) {
+                    p.draw(gl, tex, framebuffer, uniformLocs, newLast, time);
+                }
+            }
+        }
+    }
+}
+exports.WebGLProgramLoop = WebGLProgramLoop;
+
+},{}],29:[function(require,module,exports){
 var isObject = require('../internals/is-object');
 
 module.exports = function (it) {
@@ -102,7 +1599,7 @@ module.exports = function (it) {
   } return it;
 };
 
-},{"../internals/is-object":28}],3:[function(require,module,exports){
+},{"../internals/is-object":55}],30:[function(require,module,exports){
 var toIndexedObject = require('../internals/to-indexed-object');
 var toLength = require('../internals/to-length');
 var toAbsoluteIndex = require('../internals/to-absolute-index');
@@ -136,7 +1633,7 @@ module.exports = {
   indexOf: createMethod(false)
 };
 
-},{"../internals/to-absolute-index":47,"../internals/to-indexed-object":48,"../internals/to-length":50}],4:[function(require,module,exports){
+},{"../internals/to-absolute-index":74,"../internals/to-indexed-object":75,"../internals/to-length":77}],31:[function(require,module,exports){
 var fails = require('../internals/fails');
 var wellKnownSymbol = require('../internals/well-known-symbol');
 var V8_VERSION = require('../internals/engine-v8-version');
@@ -157,7 +1654,7 @@ module.exports = function (METHOD_NAME) {
   });
 };
 
-},{"../internals/engine-v8-version":14,"../internals/fails":17,"../internals/well-known-symbol":55}],5:[function(require,module,exports){
+},{"../internals/engine-v8-version":41,"../internals/fails":44,"../internals/well-known-symbol":82}],32:[function(require,module,exports){
 var isObject = require('../internals/is-object');
 var isArray = require('../internals/is-array');
 var wellKnownSymbol = require('../internals/well-known-symbol');
@@ -179,14 +1676,14 @@ module.exports = function (originalArray, length) {
   } return new (C === undefined ? Array : C)(length === 0 ? 0 : length);
 };
 
-},{"../internals/is-array":26,"../internals/is-object":28,"../internals/well-known-symbol":55}],6:[function(require,module,exports){
+},{"../internals/is-array":53,"../internals/is-object":55,"../internals/well-known-symbol":82}],33:[function(require,module,exports){
 var toString = {}.toString;
 
 module.exports = function (it) {
   return toString.call(it).slice(8, -1);
 };
 
-},{}],7:[function(require,module,exports){
+},{}],34:[function(require,module,exports){
 var has = require('../internals/has');
 var ownKeys = require('../internals/own-keys');
 var getOwnPropertyDescriptorModule = require('../internals/object-get-own-property-descriptor');
@@ -202,7 +1699,7 @@ module.exports = function (target, source) {
   }
 };
 
-},{"../internals/has":20,"../internals/object-define-property":32,"../internals/object-get-own-property-descriptor":33,"../internals/own-keys":38}],8:[function(require,module,exports){
+},{"../internals/has":47,"../internals/object-define-property":59,"../internals/object-get-own-property-descriptor":60,"../internals/own-keys":65}],35:[function(require,module,exports){
 var DESCRIPTORS = require('../internals/descriptors');
 var definePropertyModule = require('../internals/object-define-property');
 var createPropertyDescriptor = require('../internals/create-property-descriptor');
@@ -214,7 +1711,7 @@ module.exports = DESCRIPTORS ? function (object, key, value) {
   return object;
 };
 
-},{"../internals/create-property-descriptor":9,"../internals/descriptors":11,"../internals/object-define-property":32}],9:[function(require,module,exports){
+},{"../internals/create-property-descriptor":36,"../internals/descriptors":38,"../internals/object-define-property":59}],36:[function(require,module,exports){
 module.exports = function (bitmap, value) {
   return {
     enumerable: !(bitmap & 1),
@@ -224,7 +1721,7 @@ module.exports = function (bitmap, value) {
   };
 };
 
-},{}],10:[function(require,module,exports){
+},{}],37:[function(require,module,exports){
 'use strict';
 var toPrimitive = require('../internals/to-primitive');
 var definePropertyModule = require('../internals/object-define-property');
@@ -236,7 +1733,7 @@ module.exports = function (object, key, value) {
   else object[propertyKey] = value;
 };
 
-},{"../internals/create-property-descriptor":9,"../internals/object-define-property":32,"../internals/to-primitive":52}],11:[function(require,module,exports){
+},{"../internals/create-property-descriptor":36,"../internals/object-define-property":59,"../internals/to-primitive":79}],38:[function(require,module,exports){
 var fails = require('../internals/fails');
 
 // Thank's IE8 for his funny defineProperty
@@ -244,7 +1741,7 @@ module.exports = !fails(function () {
   return Object.defineProperty({}, 1, { get: function () { return 7; } })[1] != 7;
 });
 
-},{"../internals/fails":17}],12:[function(require,module,exports){
+},{"../internals/fails":44}],39:[function(require,module,exports){
 var global = require('../internals/global');
 var isObject = require('../internals/is-object');
 
@@ -256,12 +1753,12 @@ module.exports = function (it) {
   return EXISTS ? document.createElement(it) : {};
 };
 
-},{"../internals/global":19,"../internals/is-object":28}],13:[function(require,module,exports){
+},{"../internals/global":46,"../internals/is-object":55}],40:[function(require,module,exports){
 var getBuiltIn = require('../internals/get-built-in');
 
 module.exports = getBuiltIn('navigator', 'userAgent') || '';
 
-},{"../internals/get-built-in":18}],14:[function(require,module,exports){
+},{"../internals/get-built-in":45}],41:[function(require,module,exports){
 var global = require('../internals/global');
 var userAgent = require('../internals/engine-user-agent');
 
@@ -283,7 +1780,7 @@ if (v8) {
 
 module.exports = version && +version;
 
-},{"../internals/engine-user-agent":13,"../internals/global":19}],15:[function(require,module,exports){
+},{"../internals/engine-user-agent":40,"../internals/global":46}],42:[function(require,module,exports){
 // IE8- don't enum bug keys
 module.exports = [
   'constructor',
@@ -295,7 +1792,7 @@ module.exports = [
   'valueOf'
 ];
 
-},{}],16:[function(require,module,exports){
+},{}],43:[function(require,module,exports){
 var global = require('../internals/global');
 var getOwnPropertyDescriptor = require('../internals/object-get-own-property-descriptor').f;
 var createNonEnumerableProperty = require('../internals/create-non-enumerable-property');
@@ -351,7 +1848,7 @@ module.exports = function (options, source) {
   }
 };
 
-},{"../internals/copy-constructor-properties":7,"../internals/create-non-enumerable-property":8,"../internals/global":19,"../internals/is-forced":27,"../internals/object-get-own-property-descriptor":33,"../internals/redefine":40,"../internals/set-global":42}],17:[function(require,module,exports){
+},{"../internals/copy-constructor-properties":34,"../internals/create-non-enumerable-property":35,"../internals/global":46,"../internals/is-forced":54,"../internals/object-get-own-property-descriptor":60,"../internals/redefine":67,"../internals/set-global":69}],44:[function(require,module,exports){
 module.exports = function (exec) {
   try {
     return !!exec();
@@ -360,7 +1857,7 @@ module.exports = function (exec) {
   }
 };
 
-},{}],18:[function(require,module,exports){
+},{}],45:[function(require,module,exports){
 var path = require('../internals/path');
 var global = require('../internals/global');
 
@@ -373,7 +1870,7 @@ module.exports = function (namespace, method) {
     : path[namespace] && path[namespace][method] || global[namespace] && global[namespace][method];
 };
 
-},{"../internals/global":19,"../internals/path":39}],19:[function(require,module,exports){
+},{"../internals/global":46,"../internals/path":66}],46:[function(require,module,exports){
 (function (global){
 var check = function (it) {
   return it && it.Math == Math && it;
@@ -390,17 +1887,17 @@ module.exports =
   Function('return this')();
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],20:[function(require,module,exports){
+},{}],47:[function(require,module,exports){
 var hasOwnProperty = {}.hasOwnProperty;
 
 module.exports = function (it, key) {
   return hasOwnProperty.call(it, key);
 };
 
-},{}],21:[function(require,module,exports){
+},{}],48:[function(require,module,exports){
 module.exports = {};
 
-},{}],22:[function(require,module,exports){
+},{}],49:[function(require,module,exports){
 var DESCRIPTORS = require('../internals/descriptors');
 var fails = require('../internals/fails');
 var createElement = require('../internals/document-create-element');
@@ -412,7 +1909,7 @@ module.exports = !DESCRIPTORS && !fails(function () {
   }).a != 7;
 });
 
-},{"../internals/descriptors":11,"../internals/document-create-element":12,"../internals/fails":17}],23:[function(require,module,exports){
+},{"../internals/descriptors":38,"../internals/document-create-element":39,"../internals/fails":44}],50:[function(require,module,exports){
 var fails = require('../internals/fails');
 var classof = require('../internals/classof-raw');
 
@@ -427,7 +1924,7 @@ module.exports = fails(function () {
   return classof(it) == 'String' ? split.call(it, '') : Object(it);
 } : Object;
 
-},{"../internals/classof-raw":6,"../internals/fails":17}],24:[function(require,module,exports){
+},{"../internals/classof-raw":33,"../internals/fails":44}],51:[function(require,module,exports){
 var store = require('../internals/shared-store');
 
 var functionToString = Function.toString;
@@ -441,7 +1938,7 @@ if (typeof store.inspectSource != 'function') {
 
 module.exports = store.inspectSource;
 
-},{"../internals/shared-store":44}],25:[function(require,module,exports){
+},{"../internals/shared-store":71}],52:[function(require,module,exports){
 var NATIVE_WEAK_MAP = require('../internals/native-weak-map');
 var global = require('../internals/global');
 var isObject = require('../internals/is-object');
@@ -504,7 +2001,7 @@ module.exports = {
   getterFor: getterFor
 };
 
-},{"../internals/create-non-enumerable-property":8,"../internals/global":19,"../internals/has":20,"../internals/hidden-keys":21,"../internals/is-object":28,"../internals/native-weak-map":31,"../internals/shared-key":43}],26:[function(require,module,exports){
+},{"../internals/create-non-enumerable-property":35,"../internals/global":46,"../internals/has":47,"../internals/hidden-keys":48,"../internals/is-object":55,"../internals/native-weak-map":58,"../internals/shared-key":70}],53:[function(require,module,exports){
 var classof = require('../internals/classof-raw');
 
 // `IsArray` abstract operation
@@ -513,7 +2010,7 @@ module.exports = Array.isArray || function isArray(arg) {
   return classof(arg) == 'Array';
 };
 
-},{"../internals/classof-raw":6}],27:[function(require,module,exports){
+},{"../internals/classof-raw":33}],54:[function(require,module,exports){
 var fails = require('../internals/fails');
 
 var replacement = /#|\.prototype\./;
@@ -536,15 +2033,15 @@ var POLYFILL = isForced.POLYFILL = 'P';
 
 module.exports = isForced;
 
-},{"../internals/fails":17}],28:[function(require,module,exports){
+},{"../internals/fails":44}],55:[function(require,module,exports){
 module.exports = function (it) {
   return typeof it === 'object' ? it !== null : typeof it === 'function';
 };
 
-},{}],29:[function(require,module,exports){
+},{}],56:[function(require,module,exports){
 module.exports = false;
 
-},{}],30:[function(require,module,exports){
+},{}],57:[function(require,module,exports){
 var fails = require('../internals/fails');
 
 module.exports = !!Object.getOwnPropertySymbols && !fails(function () {
@@ -553,7 +2050,7 @@ module.exports = !!Object.getOwnPropertySymbols && !fails(function () {
   return !String(Symbol());
 });
 
-},{"../internals/fails":17}],31:[function(require,module,exports){
+},{"../internals/fails":44}],58:[function(require,module,exports){
 var global = require('../internals/global');
 var inspectSource = require('../internals/inspect-source');
 
@@ -561,7 +2058,7 @@ var WeakMap = global.WeakMap;
 
 module.exports = typeof WeakMap === 'function' && /native code/.test(inspectSource(WeakMap));
 
-},{"../internals/global":19,"../internals/inspect-source":24}],32:[function(require,module,exports){
+},{"../internals/global":46,"../internals/inspect-source":51}],59:[function(require,module,exports){
 var DESCRIPTORS = require('../internals/descriptors');
 var IE8_DOM_DEFINE = require('../internals/ie8-dom-define');
 var anObject = require('../internals/an-object');
@@ -583,7 +2080,7 @@ exports.f = DESCRIPTORS ? nativeDefineProperty : function defineProperty(O, P, A
   return O;
 };
 
-},{"../internals/an-object":2,"../internals/descriptors":11,"../internals/ie8-dom-define":22,"../internals/to-primitive":52}],33:[function(require,module,exports){
+},{"../internals/an-object":29,"../internals/descriptors":38,"../internals/ie8-dom-define":49,"../internals/to-primitive":79}],60:[function(require,module,exports){
 var DESCRIPTORS = require('../internals/descriptors');
 var propertyIsEnumerableModule = require('../internals/object-property-is-enumerable');
 var createPropertyDescriptor = require('../internals/create-property-descriptor');
@@ -605,7 +2102,7 @@ exports.f = DESCRIPTORS ? nativeGetOwnPropertyDescriptor : function getOwnProper
   if (has(O, P)) return createPropertyDescriptor(!propertyIsEnumerableModule.f.call(O, P), O[P]);
 };
 
-},{"../internals/create-property-descriptor":9,"../internals/descriptors":11,"../internals/has":20,"../internals/ie8-dom-define":22,"../internals/object-property-is-enumerable":37,"../internals/to-indexed-object":48,"../internals/to-primitive":52}],34:[function(require,module,exports){
+},{"../internals/create-property-descriptor":36,"../internals/descriptors":38,"../internals/has":47,"../internals/ie8-dom-define":49,"../internals/object-property-is-enumerable":64,"../internals/to-indexed-object":75,"../internals/to-primitive":79}],61:[function(require,module,exports){
 var internalObjectKeys = require('../internals/object-keys-internal');
 var enumBugKeys = require('../internals/enum-bug-keys');
 
@@ -617,10 +2114,10 @@ exports.f = Object.getOwnPropertyNames || function getOwnPropertyNames(O) {
   return internalObjectKeys(O, hiddenKeys);
 };
 
-},{"../internals/enum-bug-keys":15,"../internals/object-keys-internal":36}],35:[function(require,module,exports){
+},{"../internals/enum-bug-keys":42,"../internals/object-keys-internal":63}],62:[function(require,module,exports){
 exports.f = Object.getOwnPropertySymbols;
 
-},{}],36:[function(require,module,exports){
+},{}],63:[function(require,module,exports){
 var has = require('../internals/has');
 var toIndexedObject = require('../internals/to-indexed-object');
 var indexOf = require('../internals/array-includes').indexOf;
@@ -639,7 +2136,7 @@ module.exports = function (object, names) {
   return result;
 };
 
-},{"../internals/array-includes":3,"../internals/has":20,"../internals/hidden-keys":21,"../internals/to-indexed-object":48}],37:[function(require,module,exports){
+},{"../internals/array-includes":30,"../internals/has":47,"../internals/hidden-keys":48,"../internals/to-indexed-object":75}],64:[function(require,module,exports){
 'use strict';
 var nativePropertyIsEnumerable = {}.propertyIsEnumerable;
 var getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
@@ -654,7 +2151,7 @@ exports.f = NASHORN_BUG ? function propertyIsEnumerable(V) {
   return !!descriptor && descriptor.enumerable;
 } : nativePropertyIsEnumerable;
 
-},{}],38:[function(require,module,exports){
+},{}],65:[function(require,module,exports){
 var getBuiltIn = require('../internals/get-built-in');
 var getOwnPropertyNamesModule = require('../internals/object-get-own-property-names');
 var getOwnPropertySymbolsModule = require('../internals/object-get-own-property-symbols');
@@ -667,12 +2164,12 @@ module.exports = getBuiltIn('Reflect', 'ownKeys') || function ownKeys(it) {
   return getOwnPropertySymbols ? keys.concat(getOwnPropertySymbols(it)) : keys;
 };
 
-},{"../internals/an-object":2,"../internals/get-built-in":18,"../internals/object-get-own-property-names":34,"../internals/object-get-own-property-symbols":35}],39:[function(require,module,exports){
+},{"../internals/an-object":29,"../internals/get-built-in":45,"../internals/object-get-own-property-names":61,"../internals/object-get-own-property-symbols":62}],66:[function(require,module,exports){
 var global = require('../internals/global');
 
 module.exports = global;
 
-},{"../internals/global":19}],40:[function(require,module,exports){
+},{"../internals/global":46}],67:[function(require,module,exports){
 var global = require('../internals/global');
 var createNonEnumerableProperty = require('../internals/create-non-enumerable-property');
 var has = require('../internals/has');
@@ -708,7 +2205,7 @@ var TEMPLATE = String(String).split('String');
   return typeof this == 'function' && getInternalState(this).source || inspectSource(this);
 });
 
-},{"../internals/create-non-enumerable-property":8,"../internals/global":19,"../internals/has":20,"../internals/inspect-source":24,"../internals/internal-state":25,"../internals/set-global":42}],41:[function(require,module,exports){
+},{"../internals/create-non-enumerable-property":35,"../internals/global":46,"../internals/has":47,"../internals/inspect-source":51,"../internals/internal-state":52,"../internals/set-global":69}],68:[function(require,module,exports){
 // `RequireObjectCoercible` abstract operation
 // https://tc39.github.io/ecma262/#sec-requireobjectcoercible
 module.exports = function (it) {
@@ -716,7 +2213,7 @@ module.exports = function (it) {
   return it;
 };
 
-},{}],42:[function(require,module,exports){
+},{}],69:[function(require,module,exports){
 var global = require('../internals/global');
 var createNonEnumerableProperty = require('../internals/create-non-enumerable-property');
 
@@ -728,7 +2225,7 @@ module.exports = function (key, value) {
   } return value;
 };
 
-},{"../internals/create-non-enumerable-property":8,"../internals/global":19}],43:[function(require,module,exports){
+},{"../internals/create-non-enumerable-property":35,"../internals/global":46}],70:[function(require,module,exports){
 var shared = require('../internals/shared');
 var uid = require('../internals/uid');
 
@@ -738,7 +2235,7 @@ module.exports = function (key) {
   return keys[key] || (keys[key] = uid(key));
 };
 
-},{"../internals/shared":45,"../internals/uid":53}],44:[function(require,module,exports){
+},{"../internals/shared":72,"../internals/uid":80}],71:[function(require,module,exports){
 var global = require('../internals/global');
 var setGlobal = require('../internals/set-global');
 
@@ -747,7 +2244,7 @@ var store = global[SHARED] || setGlobal(SHARED, {});
 
 module.exports = store;
 
-},{"../internals/global":19,"../internals/set-global":42}],45:[function(require,module,exports){
+},{"../internals/global":46,"../internals/set-global":69}],72:[function(require,module,exports){
 var IS_PURE = require('../internals/is-pure');
 var store = require('../internals/shared-store');
 
@@ -759,7 +2256,7 @@ var store = require('../internals/shared-store');
   copyright: '© 2020 Denis Pushkarev (zloirock.ru)'
 });
 
-},{"../internals/is-pure":29,"../internals/shared-store":44}],46:[function(require,module,exports){
+},{"../internals/is-pure":56,"../internals/shared-store":71}],73:[function(require,module,exports){
 'use strict';
 var toInteger = require('../internals/to-integer');
 var requireObjectCoercible = require('../internals/require-object-coercible');
@@ -775,7 +2272,7 @@ module.exports = ''.repeat || function repeat(count) {
   return result;
 };
 
-},{"../internals/require-object-coercible":41,"../internals/to-integer":49}],47:[function(require,module,exports){
+},{"../internals/require-object-coercible":68,"../internals/to-integer":76}],74:[function(require,module,exports){
 var toInteger = require('../internals/to-integer');
 
 var max = Math.max;
@@ -789,7 +2286,7 @@ module.exports = function (index, length) {
   return integer < 0 ? max(integer + length, 0) : min(integer, length);
 };
 
-},{"../internals/to-integer":49}],48:[function(require,module,exports){
+},{"../internals/to-integer":76}],75:[function(require,module,exports){
 // toObject with fallback for non-array-like ES3 strings
 var IndexedObject = require('../internals/indexed-object');
 var requireObjectCoercible = require('../internals/require-object-coercible');
@@ -798,7 +2295,7 @@ module.exports = function (it) {
   return IndexedObject(requireObjectCoercible(it));
 };
 
-},{"../internals/indexed-object":23,"../internals/require-object-coercible":41}],49:[function(require,module,exports){
+},{"../internals/indexed-object":50,"../internals/require-object-coercible":68}],76:[function(require,module,exports){
 var ceil = Math.ceil;
 var floor = Math.floor;
 
@@ -808,7 +2305,7 @@ module.exports = function (argument) {
   return isNaN(argument = +argument) ? 0 : (argument > 0 ? floor : ceil)(argument);
 };
 
-},{}],50:[function(require,module,exports){
+},{}],77:[function(require,module,exports){
 var toInteger = require('../internals/to-integer');
 
 var min = Math.min;
@@ -819,7 +2316,7 @@ module.exports = function (argument) {
   return argument > 0 ? min(toInteger(argument), 0x1FFFFFFFFFFFFF) : 0; // 2 ** 53 - 1 == 9007199254740991
 };
 
-},{"../internals/to-integer":49}],51:[function(require,module,exports){
+},{"../internals/to-integer":76}],78:[function(require,module,exports){
 var requireObjectCoercible = require('../internals/require-object-coercible');
 
 // `ToObject` abstract operation
@@ -828,7 +2325,7 @@ module.exports = function (argument) {
   return Object(requireObjectCoercible(argument));
 };
 
-},{"../internals/require-object-coercible":41}],52:[function(require,module,exports){
+},{"../internals/require-object-coercible":68}],79:[function(require,module,exports){
 var isObject = require('../internals/is-object');
 
 // `ToPrimitive` abstract operation
@@ -844,7 +2341,7 @@ module.exports = function (input, PREFERRED_STRING) {
   throw TypeError("Can't convert object to primitive value");
 };
 
-},{"../internals/is-object":28}],53:[function(require,module,exports){
+},{"../internals/is-object":55}],80:[function(require,module,exports){
 var id = 0;
 var postfix = Math.random();
 
@@ -852,7 +2349,7 @@ module.exports = function (key) {
   return 'Symbol(' + String(key === undefined ? '' : key) + ')_' + (++id + postfix).toString(36);
 };
 
-},{}],54:[function(require,module,exports){
+},{}],81:[function(require,module,exports){
 var NATIVE_SYMBOL = require('../internals/native-symbol');
 
 module.exports = NATIVE_SYMBOL
@@ -861,7 +2358,7 @@ module.exports = NATIVE_SYMBOL
   // eslint-disable-next-line no-undef
   && typeof Symbol.iterator == 'symbol';
 
-},{"../internals/native-symbol":30}],55:[function(require,module,exports){
+},{"../internals/native-symbol":57}],82:[function(require,module,exports){
 var global = require('../internals/global');
 var shared = require('../internals/shared');
 var has = require('../internals/has');
@@ -880,7 +2377,7 @@ module.exports = function (name) {
   } return WellKnownSymbolsStore[name];
 };
 
-},{"../internals/global":19,"../internals/has":20,"../internals/native-symbol":30,"../internals/shared":45,"../internals/uid":53,"../internals/use-symbol-as-uid":54}],56:[function(require,module,exports){
+},{"../internals/global":46,"../internals/has":47,"../internals/native-symbol":57,"../internals/shared":72,"../internals/uid":80,"../internals/use-symbol-as-uid":81}],83:[function(require,module,exports){
 'use strict';
 var $ = require('../internals/export');
 var fails = require('../internals/fails');
@@ -942,7 +2439,7 @@ $({ target: 'Array', proto: true, forced: FORCED }, {
   }
 });
 
-},{"../internals/array-method-has-species-support":4,"../internals/array-species-create":5,"../internals/create-property":10,"../internals/engine-v8-version":14,"../internals/export":16,"../internals/fails":17,"../internals/is-array":26,"../internals/is-object":28,"../internals/to-length":50,"../internals/to-object":51,"../internals/well-known-symbol":55}],57:[function(require,module,exports){
+},{"../internals/array-method-has-species-support":31,"../internals/array-species-create":32,"../internals/create-property":37,"../internals/engine-v8-version":41,"../internals/export":43,"../internals/fails":44,"../internals/is-array":53,"../internals/is-object":55,"../internals/to-length":77,"../internals/to-object":78,"../internals/well-known-symbol":82}],84:[function(require,module,exports){
 var $ = require('../internals/export');
 var repeat = require('../internals/string-repeat');
 
@@ -952,7 +2449,7 @@ $({ target: 'String', proto: true }, {
   repeat: repeat
 });
 
-},{"../internals/export":16,"../internals/string-repeat":46}],58:[function(require,module,exports){
+},{"../internals/export":43,"../internals/string-repeat":73}],85:[function(require,module,exports){
 /**
  * dat-gui JavaScript Controller Library
  * http://code.google.com/p/dat-gui
@@ -3491,1502 +4988,5 @@ Object.defineProperty(exports, '__esModule', { value: true });
 
 })));
 
-
-},{}],59:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.CodeBuilder = void 0;
-const expr_1 = require("./expressions/expr");
-const webglprogramloop_1 = require("./webglprogramloop");
-const FRAG_SET = `  gl_FragColor = texture2D(uSampler, gl_FragCoord.xy / uResolution);\n`;
-const SCENE_SET = `uniform sampler2D uSceneSampler;\n`;
-const TIME_SET = `uniform mediump float uTime;\n`;
-const BOILERPLATE = `#ifdef GL_ES
-precision mediump float;
-#endif
-
-uniform sampler2D uSampler;
-uniform mediump vec2 uResolution;\n`;
-class CodeBuilder {
-    constructor(effectLoop) {
-        this.calls = [];
-        this.externalFuncs = new Set();
-        this.uniformDeclarations = new Set();
-        this.counter = 0;
-        this.baseLoop = effectLoop;
-        const buildInfo = {
-            uniformTypes: {},
-            externalFuncs: new Set(),
-            exprs: [],
-            needs: {
-                centerSample: false,
-                neighborSample: false,
-                depthBuffer: false,
-                sceneBuffer: false,
-                timeUniform: false,
-            },
-        };
-        this.addEffectLoop(effectLoop, 1, buildInfo);
-        // add all the types to uniform declarations from the `BuildInfo` instance
-        for (const name in buildInfo.uniformTypes) {
-            const typeName = buildInfo.uniformTypes[name];
-            this.uniformDeclarations.add(`uniform mediump ${typeName} ${name};`);
-        }
-        //this.uniformNames = Object.keys(buildInfo.uniformTypes);
-        // add all external functions from the `BuildInfo` instance
-        buildInfo.externalFuncs.forEach((func) => this.externalFuncs.add(func));
-        this.totalNeeds = buildInfo.needs;
-        this.exprs = buildInfo.exprs;
-    }
-    addEffectLoop(effectLoop, indentLevel, buildInfo, topLevel = true) {
-        const needsLoop = !topLevel && effectLoop.repeat.num > 1;
-        if (needsLoop) {
-            const iName = "i" + this.counter;
-            indentLevel++;
-            const forStart = "  ".repeat(indentLevel - 1) +
-                `for (int ${iName} = 0; ${iName} < ${effectLoop.repeat.num}; ${iName}++) {`;
-            this.calls.push(forStart);
-        }
-        for (const e of effectLoop.effects) {
-            if (e instanceof expr_1.Expr) {
-                e.parse(buildInfo);
-                this.calls.push("  ".repeat(indentLevel) + "gl_FragColor = " + e.sourceCode + ";");
-                this.counter++;
-            }
-            else {
-                this.addEffectLoop(e, indentLevel, buildInfo, false);
-            }
-        }
-        if (needsLoop) {
-            this.calls.push("  ".repeat(indentLevel - 1) + "}");
-        }
-    }
-    compileProgram(gl, vShader, uniformLocs) {
-        // set up the fragment shader
-        const fShader = gl.createShader(gl.FRAGMENT_SHADER);
-        if (fShader === null) {
-            throw new Error("problem creating fragment shader");
-        }
-        const fullCode = BOILERPLATE +
-            (this.totalNeeds.sceneBuffer ? SCENE_SET : "") +
-            (this.totalNeeds.timeUniform ? TIME_SET : "") +
-            [...this.uniformDeclarations].join("\n") +
-            [...this.externalFuncs].join("\n") +
-            "\n" +
-            //this.funcs.join("\n") +
-            "void main() {\n" +
-            (this.totalNeeds.centerSample ? FRAG_SET : "") +
-            this.calls.join("\n") +
-            "\n}";
-        gl.shaderSource(fShader, fullCode);
-        gl.compileShader(fShader);
-        // set up the program
-        const program = gl.createProgram();
-        if (program === null) {
-            throw new Error("problem creating program");
-        }
-        gl.attachShader(program, vShader);
-        gl.attachShader(program, fShader);
-        const shaderLog = (name, shader) => {
-            const output = gl.getShaderInfoLog(shader);
-            if (output)
-                console.log(`${name} shader info log\n${output}`);
-        };
-        shaderLog("vertex", vShader);
-        shaderLog("fragment", fShader);
-        gl.linkProgram(program);
-        // we need to use the program here so we can get uniform locations
-        gl.useProgram(program);
-        console.log(fullCode);
-        // find all uniform locations and add them to the dictionary
-        for (const expr of this.exprs) {
-            for (const name in expr.uniformValChangeMap) {
-                const location = gl.getUniformLocation(program, name);
-                if (location === null) {
-                    throw new Error("couldn't find uniform " + name);
-                }
-                // makes sure you don't declare uniform with same name
-                if (uniformLocs[name] !== undefined) {
-                    throw new Error("uniforms have to all have unique names");
-                }
-                // assign the name to the location
-                uniformLocs[name] = location;
-            }
-        }
-        // set the uniform resolution (every program has this uniform)
-        const uResolution = gl.getUniformLocation(program, "uResolution");
-        gl.uniform2f(uResolution, gl.drawingBufferWidth, gl.drawingBufferHeight);
-        /*
-        if (this.baseLoop.getNeeds("sceneBuffer")) {
-          // TODO allow for texture options for scene texture
-          const sceneSamplerLocation = gl.getUniformLocation(
-            program,
-            "uSceneSampler"
-          );
-          // put the scene buffer in texture 1 (0 is used for the backbuffer)
-          gl.uniform1i(sceneSamplerLocation, 1);
-        }
-        */
-        if (this.totalNeeds.sceneBuffer) {
-            // TODO allow for texture options for scene texture
-            const sceneSamplerLocation = gl.getUniformLocation(program, "uSceneSampler");
-            // put the scene buffer in texture 1 (0 is used for the backbuffer)
-            gl.uniform1i(sceneSamplerLocation, 1);
-        }
-        // get attribute
-        const position = gl.getAttribLocation(program, "aPosition");
-        // enable the attribute
-        gl.enableVertexAttribArray(position);
-        // this will point to the vertices in the last bound array buffer.
-        // In this example, we only use one array buffer, where we're storing
-        // our vertices
-        gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
-        return new webglprogramloop_1.WebGLProgramLoop(program, this.baseLoop.repeat, gl, this.totalNeeds, this.exprs);
-    }
-}
-exports.CodeBuilder = CodeBuilder;
-
-},{"./expressions/expr":65,"./webglprogramloop":85}],60:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.blur2d = exports.Blur2dLoop = void 0;
-const mergepass_1 = require("../mergepass");
-const blurexpr_1 = require("./blurexpr");
-const expr_1 = require("./expr");
-const vecexprs_1 = require("./vecexprs");
-class Blur2dLoop extends mergepass_1.EffectLoop {
-    constructor(horizontalExpr, verticalExpr, reps = 2) {
-        const side = blurexpr_1.gauss5(vecexprs_1.vec2(horizontalExpr, 0));
-        const up = blurexpr_1.gauss5(vecexprs_1.vec2(0, verticalExpr));
-        super([side, up], { num: reps });
-    }
-}
-exports.Blur2dLoop = Blur2dLoop;
-function blur2d(horizontalExpr, verticalExpr, reps) {
-    return new Blur2dLoop(expr_1.n2e(horizontalExpr), expr_1.n2e(verticalExpr), reps);
-}
-exports.blur2d = blur2d;
-
-},{"../mergepass":84,"./blurexpr":61,"./expr":65,"./vecexprs":80}],61:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.gauss5 = exports.BlurExpr = void 0;
-const glslfunctions_1 = require("../glslfunctions");
-const expr_1 = require("./expr");
-class BlurExpr extends expr_1.ExprVec4 {
-    constructor(direction) {
-        super(expr_1.tag `(gauss5(${direction}))`, ["uDirection"]);
-        this.externalFuncs = [glslfunctions_1.glslFuncs.gauss5];
-        this.needs.neighborSample = true;
-    }
-    setDirection(direction) {
-        this.setUniform("uDirection" + this.id, direction);
-    }
-}
-exports.BlurExpr = BlurExpr;
-function gauss5(direction) {
-    return new BlurExpr(direction);
-}
-exports.gauss5 = gauss5;
-
-},{"../glslfunctions":82,"./expr":65}],62:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.brightness = exports.Brightness = void 0;
-const expr_1 = require("./expr");
-const fragcolorexpr_1 = require("./fragcolorexpr");
-const glslfunctions_1 = require("../glslfunctions");
-class Brightness extends expr_1.ExprVec4 {
-    constructor(val, col = fragcolorexpr_1.fcolor()) {
-        super(expr_1.tag `(brightness(${val}, ${col}))`, ["uBrightness", "uColor"]);
-        this.externalFuncs = [glslfunctions_1.glslFuncs.brightness];
-    }
-    setBrightness(brightness) {
-        this.setUniform("uBrightness" + this.id, expr_1.n2e(brightness));
-    }
-}
-exports.Brightness = Brightness;
-function brightness(val, col) {
-    return new Brightness(expr_1.n2e(val), col);
-}
-exports.brightness = brightness;
-
-},{"../glslfunctions":82,"./expr":65,"./fragcolorexpr":66}],63:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.changecomp = exports.ChangeCompExpr = void 0;
-const expr_1 = require("./expr");
-const getcompexpr_1 = require("./getcompexpr");
-// test with just setting
-function getChangeFunc(typ, id, setter, comps, op = "") {
-    return `${typ} changecomp_${id}(${typ} col, ${setter.typeString()} setter) {
-  col.${comps} ${op}= setter;
-  return col;
-}`;
-}
-function checkGetComponents(comps, setter, vec) {
-    // setter has different length than components
-    if (comps.length !== getcompexpr_1.typeStringToLength(setter.typeString())) {
-        throw new Error("components length must be equal to the target float/vec");
-    }
-    // duplicate components
-    if (duplicateComponents(comps)) {
-        throw new Error("duplicate components not allowed on left side");
-    }
-    // legal components
-    getcompexpr_1.checkLegalComponents(comps, vec);
-}
-function duplicateComponents(comps) {
-    return new Set(comps.split("")).size !== comps.length;
-}
-class ChangeCompExpr extends expr_1.Operator {
-    constructor(vec, setter, comps, op) {
-        checkGetComponents(comps, setter, vec);
-        // TODO replace this random hash with string composed of operation properties
-        /** random hash to name a custom function */
-        const hash = Math.random().toString(36).substring(5);
-        console.log(hash);
-        super(vec, { sections: [`changecomp_${hash}(`, ", ", ")"], values: [vec, setter] }, ["uOriginal", "uNew"]);
-        this.externalFuncs = [
-            getChangeFunc(vec.typeString(), hash, setter, comps, op),
-        ];
-    }
-    setOriginal(vec) {
-        this.setUniform("uOriginal" + this.id, vec);
-    }
-    setNew(setter) {
-        this.setUniform("uNew" + this.id, expr_1.wrapInValue(setter));
-    }
-}
-exports.ChangeCompExpr = ChangeCompExpr;
-function changecomp(vec, setter, comps, op) {
-    return new ChangeCompExpr(vec, expr_1.wrapInValue(setter), comps, op);
-}
-exports.changecomp = changecomp;
-
-},{"./expr":65,"./getcompexpr":67}],64:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.contrast = exports.Contrast = void 0;
-const glslfunctions_1 = require("../glslfunctions");
-const expr_1 = require("./expr");
-const fragcolorexpr_1 = require("./fragcolorexpr");
-class Contrast extends expr_1.ExprVec4 {
-    constructor(val, col = fragcolorexpr_1.fcolor()) {
-        super(expr_1.tag `contrast(${val}, ${col})`, ["uVal", "uCol"]);
-        this.externalFuncs = [glslfunctions_1.glslFuncs.contrast];
-    }
-    setContrast(contrast) {
-        this.setUniform("uContrast" + this.id, expr_1.n2p(contrast));
-    }
-}
-exports.Contrast = Contrast;
-function contrast(val, col) {
-    return new Contrast(expr_1.n2e(val), col);
-}
-exports.contrast = contrast;
-
-},{"../glslfunctions":82,"./expr":65,"./fragcolorexpr":66}],65:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.tag = exports.wrapInValue = exports.pfloat = exports.n2p = exports.n2e = exports.Operator = exports.ExprVec4 = exports.ExprVec3 = exports.ExprVec2 = exports.float = exports.ExprFloat = exports.BasicFloat = exports.ExprVec = exports.BasicVec4 = exports.BasicVec3 = exports.BasicVec2 = exports.BasicVec = exports.PrimitiveVec4 = exports.PrimitiveVec3 = exports.PrimitiveVec2 = exports.PrimitiveVec = exports.PrimitiveFloat = exports.Primitive = exports.mut = exports.Mutable = exports.Expr = void 0;
-const mergepass_1 = require("../mergepass");
-function toGLSLFloatString(num) {
-    let str = "" + num;
-    if (!str.includes("."))
-        str += ".";
-    return str;
-}
-class Expr {
-    constructor(sourceLists, defaultNames) {
-        this.added = false;
-        this.needs = {
-            depthBuffer: false,
-            neighborSample: false,
-            centerSample: false,
-            sceneBuffer: false,
-            timeUniform: false,
-        };
-        this.uniformValChangeMap = {};
-        this.defaultNameMap = {};
-        this.externalFuncs = [];
-        this.sourceCode = "";
-        this.id = "_id_" + Expr.count;
-        Expr.count++;
-        if (sourceLists.sections.length - sourceLists.values.length !== 1) {
-            // this cannot happen if you use `tag` to destructure a template string
-            throw new Error("wrong lengths for source and values");
-        }
-        if (sourceLists.values.length !== defaultNames.length) {
-            throw new Error("default names list length doesn't match values list length");
-        }
-        this.sourceLists = sourceLists;
-        this.defaultNames = defaultNames;
-    }
-    applyUniforms(gl, uniformLocs) {
-        for (const name in this.uniformValChangeMap) {
-            const loc = uniformLocs[name];
-            if (this.uniformValChangeMap[name].changed) {
-                this.uniformValChangeMap[name].changed = false;
-                this.uniformValChangeMap[name].val.applyUniform(gl, loc);
-            }
-        }
-    }
-    getNeeds(name) {
-        return this.needs[name];
-    }
-    getSampleNum(mult = 1) {
-        return this.needs.neighborSample ? mult : 0;
-    }
-    setUniform(name, newVal) {
-        var _a, _b;
-        const originalName = name;
-        if (typeof newVal === "number") {
-            newVal = n2p(newVal);
-        }
-        if (!(newVal instanceof Primitive)) {
-            throw new Error("cannot set a non-primitive");
-        }
-        // if name does not exist, try mapping default name to new name
-        if (((_a = this.uniformValChangeMap[name]) === null || _a === void 0 ? void 0 : _a.val) === undefined) {
-            name = this.defaultNameMap[name];
-        }
-        const oldVal = (_b = this.uniformValChangeMap[name]) === null || _b === void 0 ? void 0 : _b.val;
-        if (oldVal === undefined) {
-            throw new Error("tried to set uniform " +
-                name +
-                " which doesn't exist." +
-                " original name: " +
-                originalName);
-        }
-        if (oldVal.typeString() !== newVal.typeString()) {
-            throw new Error("tried to set uniform " + name + " to a new type");
-        }
-        this.uniformValChangeMap[name].val = newVal;
-        this.uniformValChangeMap[name].changed = true;
-    }
-    /** parses this expression into a string, adding info as it recurses */
-    parse(buildInfo) {
-        if (this.added) {
-            throw new Error("expression already added to another part of tree");
-        }
-        this.sourceCode = "";
-        buildInfo.exprs.push(this);
-        const updateNeed = (name) => (buildInfo.needs[name] = buildInfo.needs[name] || this.needs[name]);
-        // update me on change to needs: no good way to iterate through an interface
-        updateNeed("centerSample");
-        updateNeed("neighborSample");
-        updateNeed("depthBuffer");
-        updateNeed("sceneBuffer");
-        updateNeed("timeUniform");
-        // add each of the external funcs to the builder
-        this.externalFuncs.forEach((func) => buildInfo.externalFuncs.add(func));
-        // put all of the values between all of the source sections
-        for (let i = 0; i < this.sourceLists.values.length; i++) {
-            this.sourceCode +=
-                this.sourceLists.sections[i] +
-                    this.sourceLists.values[i].parse(buildInfo, this.defaultNames[i], this);
-        }
-        // TODO does sourceCode have to be a member?
-        this.sourceCode += this.sourceLists.sections[this.sourceLists.sections.length - 1];
-        this.added = true;
-        return this.sourceCode;
-    }
-}
-exports.Expr = Expr;
-Expr.count = 0;
-class Mutable {
-    constructor(primitive, name) {
-        this.added = false;
-        this.primitive = primitive;
-        this.name = name;
-    }
-    parse(buildInfo, defaultName, enc) {
-        if (this.added) {
-            throw new Error("mutable expression already added to another part of tree");
-        }
-        if (enc === undefined) {
-            throw new Error("tried to put a mutable expression at the top level");
-        }
-        // accept the default name if given no name
-        if (this.name === undefined)
-            this.name = defaultName + enc.id;
-        // set to true so they are set to their default values on first draw
-        buildInfo.uniformTypes[this.name] = this.primitive.typeString();
-        // add the name mapping
-        enc.uniformValChangeMap[this.name] = {
-            val: this.primitive,
-            changed: true,
-        };
-        // add the new type to the map
-        enc.defaultNameMap[defaultName + enc.id] = this.name;
-        this.added = true;
-        return this.name;
-    }
-    applyUniform(gl, loc) {
-        this.primitive.applyUniform(gl, loc);
-    }
-    typeString() {
-        return this.primitive.typeString();
-    }
-}
-exports.Mutable = Mutable;
-function mut(val, name) {
-    const primitive = typeof val === "number" ? n2p(val) : val;
-    return new Mutable(primitive, name);
-}
-exports.mut = mut;
-class Primitive {
-    constructor() {
-        this.added = false;
-    }
-    parse(buildInfo, defaultName, enc) {
-        // TODO see if this is okay actually
-        if (this.added) {
-            throw new Error("primitive expression already added to another part of tree");
-        }
-        this.added = true;
-        return this.toString();
-    }
-}
-exports.Primitive = Primitive;
-class PrimitiveFloat extends Primitive {
-    constructor(num) {
-        // TODO throw error when NaN, Infinity or -Infinity
-        super();
-        this.value = num;
-    }
-    toString() {
-        let str = "" + this.value;
-        if (!str.includes("."))
-            str += ".";
-        return str;
-    }
-    typeString() {
-        return "float";
-    }
-    applyUniform(gl, loc) {
-        gl.uniform1f(loc, this.value);
-    }
-}
-exports.PrimitiveFloat = PrimitiveFloat;
-class PrimitiveVec extends Primitive {
-    constructor(comps) {
-        super();
-        this.values = comps;
-    }
-    typeString() {
-        return ("vec" + this.values.length);
-    }
-    toString() {
-        return `${this.typeString}(${this.values
-            .map((n) => toGLSLFloatString(n))
-            .join(", ")})`;
-    }
-}
-exports.PrimitiveVec = PrimitiveVec;
-class PrimitiveVec2 extends PrimitiveVec {
-    applyUniform(gl, loc) {
-        gl.uniform2f(loc, this.values[0], this.values[1]);
-    }
-}
-exports.PrimitiveVec2 = PrimitiveVec2;
-class PrimitiveVec3 extends PrimitiveVec {
-    applyUniform(gl, loc) {
-        gl.uniform3f(loc, this.values[0], this.values[1], this.values[2]);
-    }
-}
-exports.PrimitiveVec3 = PrimitiveVec3;
-class PrimitiveVec4 extends PrimitiveVec {
-    applyUniform(gl, loc) {
-        gl.uniform4f(loc, this.values[0], this.values[1], this.values[2], this.values[3]);
-    }
-}
-exports.PrimitiveVec4 = PrimitiveVec4;
-class BasicVec extends Expr {
-    constructor(sourceLists, defaultNames) {
-        super(sourceLists, defaultNames);
-        // this cast is fine as long as you only instantiate these with the
-        // shorthand version
-        const values = sourceLists.values;
-        this.values = values;
-        this.defaultNames = defaultNames;
-    }
-    typeString() {
-        return ("vec" + this.values.length);
-    }
-    setComp(index, primitive) {
-        if (index < 0 || index >= this.values.length) {
-            throw new Error("out of bounds of setting component");
-        }
-        this.setUniform(this.defaultNames[index] + this.id, n2p(primitive));
-    }
-}
-exports.BasicVec = BasicVec;
-class BasicVec2 extends BasicVec {
-    constructor() {
-        super(...arguments);
-        this.bvec2 = undefined; // brand for nominal typing
-    }
-}
-exports.BasicVec2 = BasicVec2;
-class BasicVec3 extends BasicVec {
-    constructor() {
-        super(...arguments);
-        this.bvec3 = undefined; // brand for nominal typing
-    }
-}
-exports.BasicVec3 = BasicVec3;
-class BasicVec4 extends BasicVec {
-    constructor() {
-        super(...arguments);
-        this.bvec4 = undefined; // brand for nominal typing
-    }
-}
-exports.BasicVec4 = BasicVec4;
-class ExprVec extends Expr {
-    constructor(sourceLists, defaultNames) {
-        super(sourceLists, defaultNames);
-        const values = sourceLists.values;
-        this.values = values;
-        this.defaultNames = defaultNames;
-    }
-}
-exports.ExprVec = ExprVec;
-class BasicFloat extends Expr {
-    constructor(sourceLists, defaultNames) {
-        super(sourceLists, defaultNames);
-        this.float = undefined; // brand for nominal typing
-    }
-    setVal(primitive) {
-        this.setUniform("uFloat" + this.id, n2p(primitive));
-    }
-    typeString() {
-        return "float";
-    }
-}
-exports.BasicFloat = BasicFloat;
-class ExprFloat extends Expr {
-    constructor(sourceLists, defaultNames) {
-        super(sourceLists, defaultNames);
-        this.float = undefined; // brand for nominal typing
-    }
-    setVal(primitive) {
-        this.setUniform("uFloat" + this.id, n2p(primitive));
-    }
-    typeString() {
-        return "float";
-    }
-}
-exports.ExprFloat = ExprFloat;
-function float(value) {
-    if (typeof value === "number")
-        value = n2p(value);
-    return new BasicFloat({ sections: ["", ""], values: [value] }, ["uFloat"]);
-}
-exports.float = float;
-class ExprVec2 extends ExprVec {
-    constructor() {
-        super(...arguments);
-        this.vec2 = undefined; // brand for nominal typing
-    }
-    typeString() {
-        return "vec2";
-    }
-}
-exports.ExprVec2 = ExprVec2;
-class ExprVec3 extends ExprVec {
-    constructor() {
-        super(...arguments);
-        this.vec3 = undefined; // brand for nominal typing
-    }
-    typeString() {
-        return "vec3";
-    }
-}
-exports.ExprVec3 = ExprVec3;
-class ExprVec4 extends ExprVec {
-    constructor() {
-        super(...arguments);
-        this.vec4 = undefined; // brand for nominal typing
-    }
-    repeat(num) {
-        return new mergepass_1.EffectLoop([this], { num: num });
-    }
-    genPrograms(gl, vShader, uniformLocs) {
-        return new mergepass_1.EffectLoop([this], { num: 1 }).genPrograms(gl, vShader, uniformLocs);
-    }
-    typeString() {
-        return "vec4";
-    }
-}
-exports.ExprVec4 = ExprVec4;
-class Operator extends Expr {
-    constructor(ret, sourceLists, defaultNames) {
-        super(sourceLists, defaultNames);
-        this.ret = ret;
-    }
-    typeString() {
-        return this.ret.typeString();
-    }
-}
-exports.Operator = Operator;
-// TODO is this necessary? can we just use wrapInValue?
-/** number to expression float */
-function n2e(num) {
-    if (num instanceof PrimitiveFloat ||
-        num instanceof ExprFloat ||
-        num instanceof Operator ||
-        num instanceof Mutable ||
-        num instanceof BasicFloat)
-        return num;
-    return new PrimitiveFloat(num);
-}
-exports.n2e = n2e;
-/** number to primitive float */
-function n2p(num) {
-    if (num instanceof PrimitiveFloat)
-        return num;
-    return new PrimitiveFloat(num);
-}
-exports.n2p = n2p;
-function pfloat(num) {
-    return new PrimitiveFloat(num);
-}
-exports.pfloat = pfloat;
-function wrapInValue(num) {
-    if (typeof num === "number")
-        return pfloat(num);
-    return num;
-}
-exports.wrapInValue = wrapInValue;
-function tag(strings, ...values) {
-    return { sections: strings.concat([]), values: values };
-}
-exports.tag = tag;
-
-},{"../mergepass":84}],66:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.fcolor = exports.FragColorExpr = void 0;
-const expr_1 = require("./expr");
-class FragColorExpr extends expr_1.ExprVec4 {
-    constructor() {
-        super(expr_1.tag `gl_FragColor`, []);
-        this.needs.centerSample = true;
-    }
-}
-exports.FragColorExpr = FragColorExpr;
-function fcolor() {
-    return new FragColorExpr();
-}
-exports.fcolor = fcolor;
-
-},{"./expr":65}],67:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.get4comp = exports.get3comp = exports.get2comp = exports.getcomp = exports.Get4CompExpr = exports.Get3CompExpr = exports.Get2CompExpr = exports.GetCompExpr = exports.checkLegalComponents = exports.typeStringToLength = void 0;
-const expr_1 = require("./expr");
-// TODO this should probably be somewhere else
-function typeStringToLength(str) {
-    switch (str) {
-        case "float":
-            return 1;
-        case "vec2":
-            return 2;
-        case "vec3":
-            return 3;
-        case "vec4":
-            return 4;
-    }
-}
-exports.typeStringToLength = typeStringToLength;
-function genCompSource(vec, components) {
-    return {
-        sections: ["", "." + components],
-        values: [vec],
-    };
-}
-function checkLegalComponents(comps, vec) {
-    const check = (range, domain) => {
-        let inside = 0;
-        let outside = 0;
-        for (const c of range) {
-            domain.includes(c) ? inside++ : outside++;
-        }
-        return inside === inside && !outside;
-    };
-    const inLen = typeStringToLength(vec.typeString());
-    const rgbaCheck = check(comps, "rgba".substr(0, inLen));
-    const xyzwCheck = check(comps, "xyzw".substr(0, inLen));
-    if (!(rgbaCheck || xyzwCheck)) {
-        throw new Error("component sets are mixed or incorrect entirely");
-    }
-}
-exports.checkLegalComponents = checkLegalComponents;
-function checkGetComponents(comps, outLen, vec) {
-    if (comps.length > outLen)
-        throw new Error("too many components");
-    checkLegalComponents(comps, vec);
-}
-class GetCompExpr extends expr_1.ExprFloat {
-    constructor(vec, comps) {
-        checkGetComponents(comps, 1, vec);
-        super(genCompSource(vec, comps), ["uVec"]);
-    }
-}
-exports.GetCompExpr = GetCompExpr;
-class Get2CompExpr extends expr_1.ExprVec2 {
-    constructor(vec, comps) {
-        checkGetComponents(comps, 2, vec);
-        super(genCompSource(vec, comps), ["uVec"]);
-    }
-}
-exports.Get2CompExpr = Get2CompExpr;
-class Get3CompExpr extends expr_1.ExprVec3 {
-    constructor(vec, comps) {
-        checkGetComponents(comps, 3, vec);
-        super(genCompSource(vec, comps), ["uVec"]);
-    }
-}
-exports.Get3CompExpr = Get3CompExpr;
-class Get4CompExpr extends expr_1.ExprVec4 {
-    constructor(vec, comps) {
-        checkGetComponents(comps, 4, vec);
-        super(genCompSource(vec, comps), ["uVec"]);
-    }
-}
-exports.Get4CompExpr = Get4CompExpr;
-function getcomp(vec, comps) {
-    return new GetCompExpr(vec, comps);
-}
-exports.getcomp = getcomp;
-function get2comp(vec, comps) {
-    return new Get2CompExpr(vec, comps);
-}
-exports.get2comp = get2comp;
-function get3comp(vec, comps) {
-    return new Get3CompExpr(vec, comps);
-}
-exports.get3comp = get3comp;
-function get4comp(vec, comps) {
-    return new Get4CompExpr(vec, comps);
-}
-exports.get4comp = get4comp;
-
-},{"./expr":65}],68:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.grain = exports.GrainExpr = void 0;
-const glslfunctions_1 = require("../glslfunctions");
-const expr_1 = require("./expr");
-class GrainExpr extends expr_1.ExprVec4 {
-    constructor(val) {
-        // TODO compose with other expressions rather than write full glsl?
-        super(expr_1.tag `vec4((1.0 - ${val} * random(gl_FragCoord.xy)) * gl_FragColor.rgb, gl_FragColor.a);`, ["uGrain"]);
-        this.externalFuncs = [glslfunctions_1.glslFuncs.random];
-        // TODO get rid of this if we choose to use fcolor instead later
-        this.needs.centerSample = true;
-    }
-    setGrain(grain) {
-        this.setUniform("uGrain" + this.id, expr_1.n2e(grain));
-    }
-}
-exports.GrainExpr = GrainExpr;
-function grain(val) {
-    return new GrainExpr(expr_1.n2e(val));
-}
-exports.grain = grain;
-
-},{"../glslfunctions":82,"./expr":65}],69:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.hsv2rgb = exports.HSVToRGBExpr = void 0;
-const expr_1 = require("./expr");
-const glslfunctions_1 = require("../glslfunctions");
-class HSVToRGBExpr extends expr_1.ExprVec4 {
-    constructor(col) {
-        super(expr_1.tag `hsv2rgb(${col})`, ["uHSVCol"]);
-        this.externalFuncs = [glslfunctions_1.glslFuncs.hsv2rgb];
-    }
-}
-exports.HSVToRGBExpr = HSVToRGBExpr;
-function hsv2rgb(col) {
-    return new HSVToRGBExpr(col);
-}
-exports.hsv2rgb = hsv2rgb;
-
-},{"../glslfunctions":82,"./expr":65}],70:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.len = exports.LenExpr = void 0;
-const expr_1 = require("./expr");
-class LenExpr extends expr_1.ExprFloat {
-    constructor(vec) {
-        super(expr_1.tag `(length(${vec}))`, ["uVec"]);
-        this.vec = vec;
-    }
-    setVec(vec) {
-        this.setUniform("uVec" + this.id, vec);
-    }
-}
-exports.LenExpr = LenExpr;
-function len(vec) {
-    return new LenExpr(vec);
-}
-exports.len = len;
-
-},{"./expr":65}],71:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.ncfcoord = exports.NormCenterFragCoordExpr = void 0;
-const expr_1 = require("./expr");
-class NormCenterFragCoordExpr extends expr_1.ExprVec2 {
-    constructor() {
-        super(expr_1.tag `(gl_FragCoord.xy / uResolution - 0.5)`, []);
-    }
-}
-exports.NormCenterFragCoordExpr = NormCenterFragCoordExpr;
-function ncfcoord() {
-    return new NormCenterFragCoordExpr();
-}
-exports.ncfcoord = ncfcoord;
-
-},{"./expr":65}],72:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.nfcoord = exports.NormFragCoordExpr = void 0;
-const expr_1 = require("./expr");
-class NormFragCoordExpr extends expr_1.ExprVec2 {
-    constructor() {
-        super(expr_1.tag `(gl_FragCoord.xy / uResolution)`, []);
-    }
-}
-exports.NormFragCoordExpr = NormFragCoordExpr;
-function nfcoord() {
-    return new NormFragCoordExpr();
-}
-exports.nfcoord = nfcoord;
-
-},{"./expr":65}],73:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.op = exports.OpExpr = void 0;
-const expr_1 = require("./expr");
-function genOpSourceList(left, op, right) {
-    return {
-        sections: ["(", ` ${op} `, ")"],
-        values: [left, right],
-    };
-}
-class OpExpr extends expr_1.Operator {
-    constructor(left, op, right) {
-        super(left, genOpSourceList(left, op, right), ["uLeft", "uRight"]);
-        this.left = left;
-        this.right = right;
-    }
-    setLeft(left) {
-        this.setUniform("uLeft" + this.id, expr_1.wrapInValue(left));
-    }
-    setRight(right) {
-        this.setUniform("uRight" + this.id, expr_1.wrapInValue(right));
-    }
-}
-exports.OpExpr = OpExpr;
-// implementation
-function op(left, op, right) {
-    return new OpExpr(expr_1.wrapInValue(left), op, expr_1.wrapInValue(right));
-}
-exports.op = op;
-
-},{"./expr":65}],74:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.pblur = exports.PowerBlurLoop = void 0;
-const mergepass_1 = require("../mergepass");
-const blurexpr_1 = require("./blurexpr");
-const vecexprs_1 = require("./vecexprs");
-const expr_1 = require("./expr");
-const baseLog = (x, y) => Math.log(y) / Math.log(x);
-class PowerBlurLoop extends mergepass_1.EffectLoop {
-    constructor(size) {
-        const side = blurexpr_1.gauss5(expr_1.mut(vecexprs_1.pvec2(size, 0)));
-        const up = blurexpr_1.gauss5(expr_1.mut(vecexprs_1.pvec2(0, size)));
-        const reps = Math.ceil(baseLog(2, size));
-        super([side, up], {
-            num: reps + 1,
-        });
-        this.size = size;
-        this.repeat.func = (i) => {
-            const distance = this.size / Math.pow(2, i);
-            up.setDirection(vecexprs_1.pvec2(0, distance));
-            side.setDirection(vecexprs_1.pvec2(distance, 0));
-        };
-    }
-    setSize(size) {
-        this.size = size;
-        this.repeat.num = Math.ceil(baseLog(2, size));
-    }
-}
-exports.PowerBlurLoop = PowerBlurLoop;
-/**
- * fast approximate blur for large blur radius that might look good in some cases
- */
-function pblur(size) {
-    return new PowerBlurLoop(size);
-}
-exports.pblur = pblur;
-
-},{"../mergepass":84,"./blurexpr":61,"./expr":65,"./vecexprs":80}],75:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.RandomExpr = void 0;
-const glslfunctions_1 = require("../glslfunctions");
-const expr_1 = require("./expr");
-class RandomExpr extends expr_1.ExprVec4 {
-    constructor() {
-        super(expr_1.tag `(random(gl_FragCoord.xy))`, []);
-        this.externalFuncs = [glslfunctions_1.glslFuncs.random];
-    }
-}
-exports.RandomExpr = RandomExpr;
-
-},{"../glslfunctions":82,"./expr":65}],76:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.rgb2hsv = exports.RGBToHSVExpr = void 0;
-const expr_1 = require("./expr");
-const glslfunctions_1 = require("../glslfunctions");
-class RGBToHSVExpr extends expr_1.ExprVec4 {
-    constructor(col) {
-        super(expr_1.tag `rgb2hsv(${col})`, ["uRGBCol"]);
-        this.externalFuncs = [glslfunctions_1.glslFuncs.rgb2hsv];
-    }
-}
-exports.RGBToHSVExpr = RGBToHSVExpr;
-function rgb2hsv(col) {
-    return new RGBToHSVExpr(col);
-}
-exports.rgb2hsv = rgb2hsv;
-
-},{"../glslfunctions":82,"./expr":65}],77:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.input = exports.SceneSampleExpr = void 0;
-const expr_1 = require("./expr");
-const normfragcoordexpr_1 = require("./normfragcoordexpr");
-class SceneSampleExpr extends expr_1.ExprVec4 {
-    constructor(coord = normfragcoordexpr_1.nfcoord()) {
-        super(expr_1.tag `(texture2D(uSceneSampler, ${coord}))`, ["uVec"]);
-        this.needs.sceneBuffer = true;
-    }
-}
-exports.SceneSampleExpr = SceneSampleExpr;
-function input(vec) {
-    return new SceneSampleExpr(vec);
-}
-exports.input = input;
-
-},{"./expr":65,"./normfragcoordexpr":72}],78:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.setcolor = exports.SetColorExpr = void 0;
-const expr_1 = require("./expr");
-class SetColorExpr extends expr_1.ExprVec4 {
-    constructor(val) {
-        super(expr_1.tag `(${val})`, ["uVal"]);
-    }
-}
-exports.SetColorExpr = SetColorExpr;
-function setcolor(val) {
-    return new SetColorExpr(val);
-}
-exports.setcolor = setcolor;
-
-},{"./expr":65}],79:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.time = exports.TimeExpr = void 0;
-const expr_1 = require("./expr");
-class TimeExpr extends expr_1.ExprFloat {
-    constructor() {
-        super(expr_1.tag `uTime`, []);
-        this.needs.timeUniform = true;
-    }
-}
-exports.TimeExpr = TimeExpr;
-function time() {
-    return new TimeExpr();
-}
-exports.time = time;
-
-},{"./expr":65}],80:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.pvec4 = exports.pvec3 = exports.pvec2 = exports.vec4 = exports.vec3 = exports.vec2 = void 0;
-const expr_1 = require("./expr");
-function vecSourceList(...components) {
-    const sections = ["vec" + components.length + "("];
-    for (let i = 0; i < components.length - 1; i++) {
-        sections.push(", ");
-    }
-    const defaultNames = [];
-    for (let i = 0; i < components.length; i++) {
-        defaultNames.push("uComp" + i);
-    }
-    sections.push(")");
-    return [{ sections: sections, values: components }, defaultNames];
-}
-// expression vector shorthands
-function vec2(comp1, comp2) {
-    return new expr_1.BasicVec2(...vecSourceList(...[comp1, comp2].map((c) => expr_1.n2e(c))));
-}
-exports.vec2 = vec2;
-function vec3(comp1, comp2, comp3) {
-    return new expr_1.BasicVec3(...vecSourceList(...[comp1, comp2, comp3].map((c) => expr_1.n2e(c))));
-}
-exports.vec3 = vec3;
-function vec4(comp1, comp2, comp3, comp4) {
-    return new expr_1.BasicVec4(...vecSourceList(...[comp1, comp2, comp3, comp4].map((c) => expr_1.n2e(c))));
-}
-exports.vec4 = vec4;
-// primitive vector shorthands
-function pvec2(comp1, comp2) {
-    return new expr_1.PrimitiveVec2([comp1, comp2]);
-}
-exports.pvec2 = pvec2;
-function pvec3(comp1, comp2, comp3) {
-    return new expr_1.PrimitiveVec2([comp1, comp2, comp3]);
-}
-exports.pvec3 = pvec3;
-function pvec4(comp1, comp2, comp3, comp4) {
-    return new expr_1.PrimitiveVec2([comp1, comp2, comp3, comp4]);
-}
-exports.pvec4 = pvec4;
-
-},{"./expr":65}],81:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-
-},{}],82:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.glslFuncs = void 0;
-// adapted from The Book of Shaders
-exports.glslFuncs = {
-    // TODO replace with a better one
-    random: `float random(vec2 st) {
-  return fract(sin(dot(st.xy / 99., vec2(12.9898, 78.233))) * 43758.5453123);
-}`,
-    //  rotate2d: `mat2 rotate2d(float angle) {
-    //  return mat2(cos(angle), -sin(angle), sin(angle), cos(angle));
-    //}`,
-    //  scale: `mat2 scale(vec2 scale) {
-    //  return mat2(scale.x, 0.0, 0.0, scale.y);
-    //}`,
-    hsv2rgb: `vec4 hsv2rgb(vec4 co){
-  vec3 c = co.xyz;
-  vec3 rgb = clamp(abs(mod(
-    c.x * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
-  rgb = rgb * rgb * (3.0 - 2.0 * rgb);
-  vec3 hsv = c.z * mix(vec3(1.0), rgb, c.y);
-  return vec4(hsv.x, hsv.y, hsv.z, co.a);
-}`,
-    rgb2hsv: `vec4 rgb2hsv(vec4 co){
-  vec3 c = co.rgb;
-  vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
-  vec4 p = mix(vec4(c.bg, K.wz),
-               vec4(c.gb, K.xy),
-               step(c.b, c.g));
-  vec4 q = mix(vec4(p.xyw, c.r),
-               vec4(c.r, p.yzx),
-               step(p.x, c.r));
-  float d = q.x - min(q.w, q.y);
-  float e = 1.0e-10;
-  return vec4(abs(q.z + (q.w - q.y) / (6.0 * d + e)),
-              d / (q.x + e),
-              q.x, co.a);
-}`,
-    // adapted from https://github.com/Jam3/glsl-fast-gaussian-blur/blob/master/5.glsl
-    gauss5: `vec4 gauss5(vec2 dir) {
-  vec2 uv = gl_FragCoord.xy / uResolution;
-  vec2 direction = dir;
-  vec4 col = vec4(0.0);
-  vec2 off1 = vec2(1.3333333333333333) * direction;
-  col += texture2D(uSampler, uv) * 0.29411764705882354;
-  col += texture2D(uSampler, uv + (off1 / uResolution)) * 0.35294117647058826;
-  col += texture2D(uSampler, uv - (off1 / uResolution)) * 0.35294117647058826;
-  return col;
-}`,
-    contrast: `vec4 contrast(float val, vec4 col) {
-  col.rgb /= col.a;
-  col.rgb = ((col.rgb - 0.5) * val) + 0.5;
-  col.rgb *= col.a;
-  return col;
-}`,
-    brightness: `vec4 brightness(float val, vec4 col) {
-  col.rgb /= col.a;
-  col.rgb += val;
-  col.rgb *= col.a;
-  return col;
-}`,
-    hsvmask: `void main(vec4 mask, vec4 components, vec4 col) {
-  vec3 hsv = rgb2hsv(col.rgb);
-  vec3 m = mask;
-  hsv.xyz = (vec3(1., 1., 1.) - m) * components + m * hsv.xyz;
-  vec3 rgb = hsv2rgb(hsv);
-  col = vec4(rgb.r, rgb.g, rgb.b, gl_FragColor.a);
-  return col;
-}`,
-    setxyz: `vec4 setxyz (vec3 comp, vec3 mask, vec4 col) {
-  col.xyz = (vec3(1., 1., 1.) - mask) * comp + m * hsv.xyz;
-}`,
-};
-
-},{}],83:[function(require,module,exports){
-"use strict";
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __exportStar = (this && this.__exportStar) || function(m, exports) {
-    for (var p in m) if (p !== "default" && !exports.hasOwnProperty(p)) __createBinding(exports, m, p);
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-// TODO export fewer things for the user
-__exportStar(require("./mergepass"), exports);
-__exportStar(require("./exprtypes"), exports);
-__exportStar(require("./glslfunctions"), exports);
-__exportStar(require("./expressions/blurexpr"), exports);
-__exportStar(require("./expressions/randomexpr"), exports);
-__exportStar(require("./expressions/fragcolorexpr"), exports);
-__exportStar(require("./expressions/vecexprs"), exports);
-__exportStar(require("./expressions/opexpr"), exports);
-__exportStar(require("./expressions/powerblur"), exports);
-__exportStar(require("./expressions/blur2dloop"), exports);
-__exportStar(require("./expressions/lenexpr"), exports);
-__exportStar(require("./expressions/normfragcoordexpr"), exports);
-__exportStar(require("./expressions/normcenterfragcoordexpr"), exports);
-__exportStar(require("./expressions/scenesampleexpr"), exports);
-__exportStar(require("./expressions/brightnessexpr"), exports);
-__exportStar(require("./expressions/setcolorexpr"), exports);
-__exportStar(require("./expressions/contrastexpr"), exports);
-__exportStar(require("./expressions/grainexpr"), exports);
-__exportStar(require("./expressions/getcompexpr"), exports);
-__exportStar(require("./expressions/changecompexpr"), exports);
-__exportStar(require("./expressions/rgbtohsvexpr"), exports);
-__exportStar(require("./expressions/hsvtorgbexpr"), exports);
-__exportStar(require("./expressions/timeexpr"), exports);
-__exportStar(require("./expressions/expr"), exports);
-
-},{"./expressions/blur2dloop":60,"./expressions/blurexpr":61,"./expressions/brightnessexpr":62,"./expressions/changecompexpr":63,"./expressions/contrastexpr":64,"./expressions/expr":65,"./expressions/fragcolorexpr":66,"./expressions/getcompexpr":67,"./expressions/grainexpr":68,"./expressions/hsvtorgbexpr":69,"./expressions/lenexpr":70,"./expressions/normcenterfragcoordexpr":71,"./expressions/normfragcoordexpr":72,"./expressions/opexpr":73,"./expressions/powerblur":74,"./expressions/randomexpr":75,"./expressions/rgbtohsvexpr":76,"./expressions/scenesampleexpr":77,"./expressions/setcolorexpr":78,"./expressions/timeexpr":79,"./expressions/vecexprs":80,"./exprtypes":81,"./glslfunctions":82,"./mergepass":84}],84:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.sendTexture = exports.makeTexture = exports.Merger = exports.loop = exports.EffectLoop = exports.getNeedsOfList = void 0;
-const codebuilder_1 = require("./codebuilder");
-const webglprogramloop_1 = require("./webglprogramloop");
-// TODO get rid of this
-function getNeedsOfList(name, list) {
-    if (list.length === 0) {
-        throw new Error("list was empty, so no needs could be found");
-    }
-    const bools = list.map((e) => e.getNeeds(name));
-    return bools.reduce((acc, curr) => acc || curr);
-}
-exports.getNeedsOfList = getNeedsOfList;
-class EffectLoop {
-    constructor(effects, repeat) {
-        this.effects = effects;
-        this.repeat = repeat;
-    }
-    getNeeds(name) {
-        return getNeedsOfList(name, this.effects);
-        //const bools: boolean[] = this.effects.map((e) => e.getNeeds(name));
-        //return bools.reduce((acc: boolean, curr: boolean) => acc || curr);
-    }
-    getSampleNum(mult = 1) {
-        mult *= this.repeat.num;
-        let acc = 0;
-        for (const e of this.effects) {
-            acc += e.getSampleNum(mult);
-        }
-        return acc;
-    }
-    /** places effects into loops broken up by sampling effects */
-    regroup() {
-        let sampleCount = 0;
-        /** number of samples in all previous */
-        let prevSampleCount = 0;
-        let prevEffects = [];
-        const regroupedEffects = [];
-        const breakOff = () => {
-            if (prevEffects.length > 0) {
-                // break off all previous effects into their own loop
-                if (prevEffects.length === 1) {
-                    // this is to prevent wrapping in another effect loop
-                    regroupedEffects.push(prevEffects[0]);
-                }
-                else {
-                    regroupedEffects.push(new EffectLoop(prevEffects, { num: 1 }));
-                }
-                sampleCount -= prevSampleCount;
-                prevEffects = [];
-            }
-        };
-        for (const e of this.effects) {
-            const sampleNum = e.getSampleNum();
-            prevSampleCount = sampleCount;
-            sampleCount += sampleNum;
-            if (sampleCount > 0)
-                breakOff();
-            prevEffects.push(e);
-        }
-        // push on all the straggling effects after the grouping is done
-        breakOff();
-        return regroupedEffects;
-    }
-    /** recursive descent parser for turning effects into programs */
-    genPrograms(gl, vShader, uniformLocs) {
-        // TODO we probably don't need scenesource anymore
-        if (this.getSampleNum() / this.repeat.num <= 1) {
-            // if this group only samples neighbors at most once, create program
-            const codeBuilder = new codebuilder_1.CodeBuilder(this);
-            const program = codeBuilder.compileProgram(gl, vShader, uniformLocs);
-            return program;
-        }
-        // otherwise, regroup and try again on regrouped loops
-        this.effects = this.regroup();
-        // okay to have undefined needs here
-        return new webglprogramloop_1.WebGLProgramLoop(this.effects.map((e) => e.genPrograms(gl, vShader, uniformLocs)), this.repeat, gl);
-    }
-}
-exports.EffectLoop = EffectLoop;
-function loop(effects, rep) {
-    return new EffectLoop(effects, { num: rep });
-}
-exports.loop = loop;
-const V_SOURCE = `attribute vec2 aPosition;
-void main() {
-  gl_Position = vec4(aPosition, 0.0, 1.0);
-}\n`;
-class Merger {
-    constructor(effects, source, gl, options) {
-        this.uniformLocs = {};
-        // wrap the given list of effects as a loop if need be
-        if (!(effects instanceof EffectLoop)) {
-            this.effectLoop = new EffectLoop(effects, { num: 1 });
-        }
-        else {
-            this.effectLoop = effects;
-        }
-        if (this.effectLoop.effects.length === 0) {
-            throw new Error("list of effects was empty");
-        }
-        this.source = source;
-        this.gl = gl;
-        this.options = options;
-        // set the viewport
-        this.gl.viewport(0, 0, this.gl.drawingBufferWidth, this.gl.drawingBufferHeight);
-        // set up the vertex buffer
-        const vertexBuffer = this.gl.createBuffer();
-        this.gl.bindBuffer(this.gl.ARRAY_BUFFER, vertexBuffer);
-        const vertexArray = [-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1];
-        const triangles = new Float32Array(vertexArray);
-        this.gl.bufferData(this.gl.ARRAY_BUFFER, triangles, this.gl.STATIC_DRAW);
-        // compile the simple vertex shader (2 big triangles)
-        const vShader = this.gl.createShader(this.gl.VERTEX_SHADER);
-        if (vShader === null) {
-            throw new Error("problem creating the vertex shader");
-        }
-        this.gl.shaderSource(vShader, V_SOURCE);
-        this.gl.compileShader(vShader);
-        // make textures
-        this.tex = {
-            front: makeTexture(this.gl, this.options),
-            back: makeTexture(this.gl, this.options),
-            scene: undefined,
-        };
-        // create the framebuffer
-        const framebuffer = gl.createFramebuffer();
-        if (framebuffer === null) {
-            throw new Error("problem creating the framebuffer");
-        }
-        this.framebuffer = framebuffer;
-        // generate the fragment shaders and programs
-        this.programLoop = this.effectLoop.genPrograms(this.gl, vShader, this.uniformLocs);
-        // find the final program
-        let atBottom = false;
-        let currProgramLoop = this.programLoop;
-        while (!atBottom) {
-            if (currProgramLoop.programElement instanceof WebGLProgram) {
-                // we traveled right and hit a program, so it must be the last
-                currProgramLoop.last = true;
-                atBottom = true;
-            }
-            else {
-                // set the current program loop to the last in the list
-                currProgramLoop =
-                    currProgramLoop.programElement[currProgramLoop.programElement.length - 1];
-            }
-        }
-        if (this.programLoop.getTotalNeeds().sceneBuffer) {
-            this.tex.scene = makeTexture(this.gl, this.options);
-        }
-        // TODO get rid of this (or make it only log when verbose)
-        console.log(this.programLoop);
-    }
-    draw(time = 0) {
-        //this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, this.framebuffer);
-        this.gl.activeTexture(this.gl.TEXTURE0);
-        this.gl.bindTexture(this.gl.TEXTURE_2D, this.tex.back);
-        sendTexture(this.gl, this.source);
-        if (this.programLoop.getTotalNeeds().sceneBuffer &&
-            this.tex.scene !== undefined) {
-            this.gl.activeTexture(this.gl.TEXTURE1);
-            this.gl.bindTexture(this.gl.TEXTURE_2D, this.tex.scene);
-            sendTexture(this.gl, this.source);
-        }
-        // swap textures before beginning draw
-        this.programLoop.draw(this.gl, this.tex, this.framebuffer, this.uniformLocs, this.programLoop.last, time);
-    }
-}
-exports.Merger = Merger;
-function makeTexture(gl, options) {
-    const texture = gl.createTexture();
-    if (texture === null) {
-        throw new Error("problem creating texture");
-    }
-    // flip the order of the pixels, or else it displays upside down
-    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-    // bind the texture after creating it
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.drawingBufferWidth, gl.drawingBufferHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    const filterMode = (f) => f === undefined || f === "linear" ? gl.LINEAR : gl.NEAREST;
-    // how to map texture element
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filterMode(options === null || options === void 0 ? void 0 : options.minFilterMode));
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filterMode(options === null || options === void 0 ? void 0 : options.maxFilterMode));
-    if ((options === null || options === void 0 ? void 0 : options.edgeMode) !== "wrap") {
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    }
-    return texture;
-}
-exports.makeTexture = makeTexture;
-function sendTexture(gl, src) {
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
-}
-exports.sendTexture = sendTexture;
-
-},{"./codebuilder":59,"./webglprogramloop":85}],85:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.WebGLProgramLoop = void 0;
-class WebGLProgramLoop {
-    constructor(programElement, repeat, gl, totalNeeds, // only defined when leaf
-    effects = [] // only populated when leaf
-    ) {
-        var _a;
-        this.last = false;
-        this.programElement = programElement;
-        this.repeat = repeat;
-        this.totalNeeds = totalNeeds;
-        this.effects = effects;
-        if (programElement instanceof WebGLProgram) {
-            if (gl === undefined) {
-                throw new Error("program element is a program but context is undefined");
-            }
-            if ((_a = this.totalNeeds) === null || _a === void 0 ? void 0 : _a.timeUniform) {
-                gl.useProgram(programElement);
-                const timeLoc = gl.getUniformLocation(programElement, "uTime");
-                if (timeLoc === null) {
-                    throw new Error("could not get the time uniform location");
-                }
-                this.timeLoc = timeLoc;
-            }
-        }
-    }
-    getTotalNeeds() {
-        // go through needs of program loop
-        if (!(this.programElement instanceof WebGLProgram)) {
-            const allNeeds = [];
-            for (const p of this.programElement) {
-                allNeeds.push(p.getTotalNeeds());
-            }
-            // update me on change to needs
-            return allNeeds.reduce((acc, curr) => {
-                return {
-                    neighborSample: acc.neighborSample || curr.neighborSample,
-                    centerSample: acc.centerSample || curr.centerSample,
-                    sceneBuffer: acc.sceneBuffer || curr.sceneBuffer,
-                    depthBuffer: acc.depthBuffer || curr.depthBuffer,
-                    timeUniform: acc.timeUniform || curr.timeUniform,
-                };
-            });
-        }
-        if (this.totalNeeds === undefined) {
-            throw new Error("total needs of webgl program was somehow undefined");
-        }
-        return this.totalNeeds;
-    }
-    draw(gl, tex, framebuffer, uniformLocs, last, time) {
-        var _a, _b;
-        for (let i = 0; i < this.repeat.num; i++) {
-            const newLast = i === this.repeat.num - 1;
-            if (this.programElement instanceof WebGLProgram) {
-                // effects list is populated
-                if (i === 0) {
-                    gl.useProgram(this.programElement);
-                    if ((_a = this.totalNeeds) === null || _a === void 0 ? void 0 : _a.sceneBuffer) {
-                        if (tex.scene === undefined) {
-                            throw new Error("needs scene buffer, but scene texture is somehow undefined");
-                        }
-                        gl.activeTexture(gl.TEXTURE1);
-                        gl.bindTexture(gl.TEXTURE_2D, tex.scene);
-                    }
-                    for (const effect of this.effects) {
-                        effect.applyUniforms(gl, uniformLocs);
-                    }
-                    if ((_b = this.totalNeeds) === null || _b === void 0 ? void 0 : _b.timeUniform) {
-                        if (this.timeLoc === undefined || time === undefined) {
-                            throw new Error("time or location is undefined");
-                        }
-                        gl.uniform1f(this.timeLoc, time);
-                    }
-                }
-                if (newLast && last && this.last) {
-                    // we are on the final pass of the final loop, so draw screen by
-                    // setting to the default framebuffer
-                    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-                }
-                else {
-                    // we have to bounce between two textures
-                    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-                    // use the framebuffer to write to front texture
-                    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex.front, 0);
-                }
-                // allows us to read from `texBack`
-                // default sampler is 0, so `uSampler` uniform will always sample from texture 0
-                gl.activeTexture(gl.TEXTURE0);
-                gl.bindTexture(gl.TEXTURE_2D, tex.back);
-                [tex.back, tex.front] = [tex.front, tex.back];
-                // go back to the default framebuffer object
-                // use our last program as the draw program
-                gl.drawArrays(gl.TRIANGLES, 0, 6);
-            }
-            else {
-                if (this.repeat.func !== undefined) {
-                    this.repeat.func(i);
-                }
-                for (const p of this.programElement) {
-                    p.draw(gl, tex, framebuffer, uniformLocs, newLast, time);
-                }
-            }
-        }
-    }
-}
-exports.WebGLProgramLoop = WebGLProgramLoop;
 
 },{}]},{},[1]);
